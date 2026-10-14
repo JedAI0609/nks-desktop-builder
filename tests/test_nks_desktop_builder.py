@@ -118,6 +118,28 @@ class TestAudioDiscovery:
         assert hit.name == "Deep Pad.wav"
         assert "Instruments Data" in hit.parts
 
+    def test_strip_mb03_prefix_matches_samples(self, tmp_path: Path, ffmpeg: str):
+        root = tmp_path / "Lib"
+        samples = root / "Samples" / "Loops"
+        samples.mkdir(parents=True)
+        # wav without library prefix
+        _make_wav(ffmpeg, samples / "Clocks_Loops.wav", 440)
+        idx = m.build_source_audio_index(root)
+        hit = m.pick_matching_wav("MB03_Clocks_Loops", idx, root)
+        assert hit is not None
+        assert hit.name == "Clocks_Loops.wav"
+        assert "Samples" in hit.parts
+
+    def test_fallback_uses_first_samples_wav(self, tmp_path: Path, ffmpeg: str):
+        root = tmp_path / "Lib"
+        samples = root / "Samples"
+        samples.mkdir(parents=True)
+        _make_wav(ffmpeg, samples / "OnlyOne.wav", 330)
+        idx = m.build_source_audio_index(root)
+        hit = m.pick_matching_wav("TotallyUnrelatedPresetName", idx, root)
+        assert hit is not None
+        assert hit.name == "OnlyOne.wav"
+
     def test_previews_folder_excluded_from_index(self, tmp_path: Path, ffmpeg: str):
         root = tmp_path / "Lib"
         (root / ".previews").mkdir(parents=True)
@@ -140,7 +162,17 @@ class TestNiAssets:
         img = m.generate_placeholder_artwork("test", "Vendor", "Library")
         written = m.format_ni_images(img, tmp_path / "out")
         assert set(written) == set(m.NI_IMAGE_SPECS)
-        for name, dims in m.NI_IMAGE_SPECS.items():
+        assert len(written) == 6
+        expected = {
+            "MST_artwork.png": (134, 66),
+            "MST_logo.png": (134, 66),
+            "BND_artwork.png": (272, 90),
+            "BND_logo.png": (272, 90),
+            "NKS2_software_tile.png": (420, 136),
+            "NKS2_hardware_banner.png": (1280, 212),
+        }
+        assert m.NI_IMAGE_SPECS == expected
+        for name, dims in expected.items():
             assert Image.open(written[name]).size == dims
 
     def test_dist_database_payload(self, tmp_path: Path):

@@ -57,7 +57,7 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 APP_DIR = Path("/Users/fuckem/dev").resolve()
 APP_TITLE = "NKS Desktop Builder"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 DEFAULT_NI_ROOT = Path("/Users/Shared/NI Resources")
 DEFAULT_IMAGE_ROOT = DEFAULT_NI_ROOT / "image"
@@ -69,11 +69,17 @@ SOURCE_AUDIO_EXTENSIONS = (".wav", ".wave", ".aif", ".aiff", ".flac", ".mp3", ".
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}
 ARTWORK_KEYWORDS = ("wallpaper", "banner", "folder", "artwork", "icon")
 
+# Complete NKS2 / Kontakt 7–8 sidebar visual array (exact pixel sizes).
 NI_IMAGE_SPECS: dict[str, tuple[int, int]] = {
-    "MST_artwork.png": (114, 46),
-    "MST_logo.png": (114, 46),
+    "MST_artwork.png": (134, 66),
+    "MST_logo.png": (134, 66),
     "BND_artwork.png": (272, 90),
+    "BND_logo.png": (272, 90),
+    "NKS2_software_tile.png": (420, 136),
+    "NKS2_hardware_banner.png": (1280, 212),
 }
+# Filenames that use contain/logo treatment instead of cover-crop.
+NI_LOGO_FILES = frozenset({"MST_logo.png", "BND_logo.png"})
 
 PREVIEW_DURATION_SEC = 2.0
 FFMPEG_CANDIDATES = (
@@ -496,10 +502,20 @@ def fit_logo(img: Image.Image, size: tuple[int, int]) -> Image.Image:
 
 
 def format_ni_images(source_image: Image.Image, dest_dir: Path) -> dict[str, Path]:
+    """
+    Write the full modern NKS2 image set into dest_dir:
+      MST_artwork / MST_logo (134×66),
+      BND_artwork / BND_logo (272×90),
+      NKS2_software_tile (420×136),
+      NKS2_hardware_banner (1280×212).
+    """
     ensure_dir(dest_dir)
     written: dict[str, Path] = {}
     for filename, dims in NI_IMAGE_SPECS.items():
-        out = fit_logo(source_image, dims) if filename == "MST_logo.png" else fit_cover(source_image, dims)
+        if filename in NI_LOGO_FILES:
+            out = fit_logo(source_image, dims)
+        else:
+            out = fit_cover(source_image, dims)
         target = dest_dir / filename
         out.save(target, format="PNG", optimize=True)
         written[filename] = target
@@ -579,6 +595,94 @@ def _normalize_audio_key(name: str) -> str:
     return s
 
 
+def _strip_library_prefixes(stem: str) -> list[str]:
+    """
+    Produce cleaned variants of a preset stem by stripping common leading
+    library prefixes such as MB03_, LIB1-, A1_, etc.
+
+    Returns unique variants including the original stem (first).
+    """
+    raw = (stem or "").strip()
+    variants: list[str] = []
+    seen: set[str] = set()
+
+    def add(v: str) -> None:
+        v = v.strip(" _-.")
+        if not v:
+            return
+        key = v.lower()
+        if key not in seen:
+            seen.add(key)
+            variants.append(v)
+
+    add(raw)
+
+    # Repeatedly peel alphanumeric library tags: MB03_, MX_01_, LIB12-
+    peeled = raw
+    for _ in range(4):
+        m = re.match(
+            r"^(?:[A-Za-z]{1,8}\d{0,4}|\d{1,4}[A-Za-z]{0,4})[_\-\.]+(.+)$",
+            peeled,
+        )
+        if not m:
+            break
+        peeled = m.group(1)
+        add(peeled)
+
+    # Also drop a single leading token before underscore if remainder is long enough
+    parts = re.split(r"[_\-]+", raw)
+    if len(parts) >= 2:
+        # Prefer joining all but first token (MB03_Clocks_Loops → Clocks_Loops)
+        add("_".join(parts[1:]))
+        add(" ".join(parts[1:]))
+        # And last significant token alone if long enough (Clocks)
+        if len(parts[-1]) >= 4:
+            add(parts[-1])
+
+    return variants
+
+
+def _sequence_similarity(a: str, b: str) -> float:
+    """Simple 0..1 similarity for ranking fuzzy name pairs."""
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    if a in b or b in a:
+        shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+        return 0.72 + 0.28 * (len(shorter) / max(len(longer), 1))
+    # token overlap on split digits/letters
+    ta = set(re.findall(r"[a-z]+|\d+", a))
+    tb = set(re.findall(r"[a-z]+|\d+", b))
+    if not ta or not tb:
+        return 0.0
+    inter = len(ta & tb)
+    union = len(ta | tb)
+    return inter / union if union else 0.0
+
+
+def _is_under_samples_tree(path: Path, source_root: Path) -> bool:
+    try:
+        parts = [p.lower() for p in path.relative_to(source_root).parts]
+    except ValueError:
+        parts = [p.lower() for p in path.parts]
+    return any(p in {"samples", "sample", "wavs", "waves", "audio"} for p in parts)
+
+
+def _list_all_audio_paths(index: dict[str, list[Path]]) -> list[Path]:
+    seen: set[str] = set()
+    out: list[Path] = []
+    for key, paths in index.items():
+        if key.startswith("norm:"):
+            continue
+        for p in paths:
+            s = str(p)
+            if s not in seen:
+                seen.add(s)
+                out.append(p)
+    return out
+
+
 def _audio_dir_priority(path: Path, source_root: Path) -> int:
     """
     Lower is better. Prefer files nested under Samples / Instruments Data / etc.
@@ -628,64 +732,101 @@ def pick_matching_wav(
     source_root: Path | None = None,
 ) -> Path | None:
     """
-    Find best matching source audio for a preset stem.
+    Intelligent fuzzy audio discovery for a preset stem.
 
     Match order:
-      1. Exact stem (case-insensitive), e.g. MB03_Clocks_Loops.nki → MB03_Clocks_Loops.wav
-      2. Normalized stem (ignore spaces/underscores/hyphens)
-      3. Unique normalized containment (preset stem contained in audio name or vice versa)
+      1. Exact 1:1 stem (case-insensitive)
+      2. Prefix-stripped variants (MB03_Clocks_Loops → Clocks_Loops, …)
+      3. Normalized / partial fuzzy match, preferring files under Samples/
+      4. Closest string similarity among Samples (and other preferred trees)
+      5. Safe fallback: first available .wav in the best Samples segment so a
+         preset is never left without audio when any sample exists in-tree
 
-    Among candidates, prefer files under Samples / Instruments Data / … then .wav.
-    Original audio files are never modified — path is read-only for ffmpeg -i.
+    Original audio is never modified — path is read-only for ffmpeg -i.
     """
-    stem_l = (stem or "").lower()
-    norm = _normalize_audio_key(stem)
-    candidates: list[Path] = []
-
-    # 1) Exact stem
-    candidates.extend(index.get(stem_l, []))
-
-    # 2) Normalized exact
-    if norm:
-        for p in index.get(f"norm:{norm}", []):
-            if p not in candidates:
-                candidates.append(p)
-
-    # 3) Fuzzy containment across full recursive inventory (only if still empty)
-    if not candidates and norm and len(norm) >= 4:
-        fuzzy: list[Path] = []
-        seen: set[str] = set()
-        for key, paths in index.items():
-            if key.startswith("norm:"):
-                other = key[5:]
-            else:
-                other = _normalize_audio_key(key)
-            if not other:
-                continue
-            if norm == other or norm in other or other in norm:
-                for p in paths:
-                    pk = str(p)
-                    if pk not in seen:
-                        seen.add(pk)
-                        fuzzy.append(p)
-        # Only accept fuzzy if unambiguous-ish (prefer unique; else still rank)
-        candidates.extend(fuzzy)
-
-    if not candidates:
-        return None
-
     root = source_root or Path("/")
     ext_rank = {ext: i for i, ext in enumerate(SOURCE_AUDIO_EXTENSIONS)}
+    all_audio = _list_all_audio_paths(index)
+    if not all_audio:
+        return None
 
-    def sort_key(p: Path) -> tuple[int, int, int, str]:
-        return (
-            _audio_dir_priority(p, root),
-            ext_rank.get(p.suffix.lower(), 999),
-            len(str(p)),  # shorter paths slightly preferred when tied
-            str(p).lower(),
+    samples_audio = [p for p in all_audio if _is_under_samples_tree(p, root)]
+    preferred_pool = samples_audio or all_audio
+
+    scored: list[tuple[float, int, int, Path]] = []  # (-sim, dir_pri, ext_pri, path)
+    seen: set[str] = set()
+
+    def consider(path: Path, similarity: float) -> None:
+        key = str(path)
+        if key in seen:
+            # Keep best similarity if re-considered
+            return
+        seen.add(key)
+        scored.append(
+            (
+                -float(similarity),
+                _audio_dir_priority(path, root),
+                ext_rank.get(path.suffix.lower(), 999),
+                path,
+            )
         )
 
-    return sorted(candidates, key=sort_key)[0]
+    variants = _strip_library_prefixes(stem)
+    norms = [_normalize_audio_key(v) for v in variants if _normalize_audio_key(v)]
+
+    # 1–2) Exact + prefix-stripped exact (raw and normalized keys)
+    for v in variants:
+        for p in index.get(v.lower(), []):
+            consider(p, 1.0)
+        nv = _normalize_audio_key(v)
+        if nv:
+            for p in index.get(f"norm:{nv}", []):
+                consider(p, 0.98)
+
+    # 3) Partial / fuzzy against inventory (Samples first via scoring)
+    if not scored:
+        for p in preferred_pool:
+            pnorm = _normalize_audio_key(p.stem)
+            best_sim = 0.0
+            for nv in norms:
+                if not nv or len(nv) < 3:
+                    continue
+                if nv == pnorm:
+                    best_sim = max(best_sim, 1.0)
+                elif nv in pnorm or pnorm in nv:
+                    best_sim = max(best_sim, _sequence_similarity(nv, pnorm))
+                else:
+                    best_sim = max(best_sim, _sequence_similarity(nv, pnorm))
+            if best_sim >= 0.34:
+                consider(p, best_sim)
+
+    # 4) If still nothing, rank entire preferred pool by closest string
+    if not scored:
+        ranked: list[tuple[float, Path]] = []
+        for p in preferred_pool:
+            pnorm = _normalize_audio_key(p.stem)
+            sim = max((_sequence_similarity(nv, pnorm) for nv in norms), default=0.0)
+            ranked.append((sim, p))
+        ranked.sort(key=lambda t: (-t[0], _audio_dir_priority(t[1], root), str(t[1]).lower()))
+        if ranked and ranked[0][0] > 0:
+            consider(ranked[0][1], ranked[0][0])
+
+    # 5) Guaranteed fallback — never leave a preset without audio if any wav exists
+    if not scored:
+        # Prefer first .wav under Samples tree (stable sort by path), else any audio
+        wavs = [
+            p
+            for p in preferred_pool
+            if p.suffix.lower() in {".wav", ".wave"}
+        ] or preferred_pool
+        wavs_sorted = sorted(
+            wavs,
+            key=lambda p: (_audio_dir_priority(p, root), str(p).lower()),
+        )
+        consider(wavs_sorted[0], 0.01)
+
+    scored.sort()
+    return scored[0][3]
 
 
 def ffmpeg_preview_cmd(ffmpeg: str, src: Path, dst: Path) -> list[str]:

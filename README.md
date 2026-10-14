@@ -84,7 +84,7 @@ python nks_preview_bot.py \
 
 | Stage | Destination |
 |-------|-------------|
-| **Artwork** | `/Users/Shared/NI Resources/image/[Vendor]/[Library]/` — `MST_artwork.png` (114×46), `MST_logo.png` (114×46), `BND_artwork.png` (272×90) |
+| **Artwork** | `/Users/Shared/NI Resources/image/[Vendor]/[Library]/` — full NKS2 set: `MST_artwork`/`MST_logo` (134×66), `BND_artwork`/`BND_logo` (272×90), `NKS2_software_tile` (420×136), `NKS2_hardware_banner` (1280×212) |
 | **Database JSON** | `/Users/Shared/NI Resources/dist_database/[Vendor]/[Library]/` |
 | **Presets + previews** | **Inside the selected source library**: hidden `.previews/` folders with `[PresetName].[ext].ogg` (hard trim **2.0s**, vorbis) |
 
