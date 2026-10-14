@@ -62,7 +62,7 @@ APP_VERSION = "1.0.0"
 DEFAULT_NI_ROOT = Path("/Users/Shared/NI Resources")
 DEFAULT_IMAGE_ROOT = DEFAULT_NI_ROOT / "image"
 DEFAULT_DIST_DB_ROOT = DEFAULT_NI_ROOT / "dist_database"
-DEFAULT_OUTPUT = Path.home() / "Documents" / "Native Instruments" / "User Content"
+# Output is always the selected source library folder (in-place). No manual target.
 
 PRESET_EXTENSIONS = {".nki", ".nksn", ".nksf", ".nkm", ".nrkt", ".nkt"}
 SOURCE_AUDIO_EXTENSIONS = (".wav", ".wave", ".aif", ".aiff", ".flac", ".mp3", ".ogg")
@@ -619,25 +619,45 @@ def mirror_presets_and_previews(
     log: Callable[[str], None] | None = None,
     progress: Callable[[float, str], None] | None = None,
 ) -> tuple[int, int, int, int, list[str]]:
+    """
+    Deploy .previews OGG matrices beside presets.
+
+    When target_root is the same directory as source_root (in-place / auto-target),
+    presets are left where they are and only hidden .previews folders are written
+    next to them. Otherwise presets are copied into target_root first.
+    """
     ensure_dir(target_root)
+    try:
+        in_place = source_root.resolve() == target_root.resolve()
+    except OSError:
+        in_place = str(source_root) == str(target_root)
+
     audio_index = build_source_audio_index(source_root)
     presets = list(iter_preset_files(source_root))
     total = max(len(presets), 1)
     mirrored = ok = fail = missing = 0
     errors: list[str] = []
 
+    if log:
+        mode = "in-place (original library folder)" if in_place else f"copy → {target_root}"
+        log(f"Preset/preview deploy mode: {mode}")
+
     for i, preset in enumerate(presets):
         rel = preset.relative_to(source_root)
-        dest_preset = target_root / rel
-        ensure_dir(dest_preset.parent)
-        try:
-            shutil.copy2(preset, dest_preset)
+        if in_place:
+            dest_preset = preset
             mirrored += 1
-        except OSError as exc:
-            errors.append(f"copy failed {preset}: {exc}")
-            if progress:
-                progress((i + 1) / total, f"Copy failed: {rel}")
-            continue
+        else:
+            dest_preset = target_root / rel
+            ensure_dir(dest_preset.parent)
+            try:
+                shutil.copy2(preset, dest_preset)
+                mirrored += 1
+            except OSError as exc:
+                errors.append(f"copy failed {preset}: {exc}")
+                if progress:
+                    progress((i + 1) / total, f"Copy failed: {rel}")
+                continue
 
         previews_dir = ensure_dir(dest_preset.parent / ".previews")
         out_ogg = previews_dir / f"{dest_preset.name}.ogg"
@@ -735,13 +755,22 @@ def run_pipeline(
         _log(traceback.format_exc())
         return result
 
-    # Stage 3 — presets + previews
-    _prog(0.50, "Stage 3/3 · Mirroring presets & building .previews…")
+    # Stage 3 — presets + previews (always deploy into the original library folder)
+    _prog(0.50, "Stage 3/3 · Building .previews in original library folder…")
     if not source_path.is_dir():
         result.errors.append(f"Source path is not a directory: {source_path}")
         return result
 
-    library_out = ensure_dir(output_path / library_s)
+    try:
+        library_out = source_path.expanduser().resolve()
+    except OSError:
+        library_out = source_path.expanduser()
+    # output_path is accepted for API compatibility but ignored: conversion is in-place.
+    _ = output_path
+    ensure_dir(library_out)
+    _log(f"In-place NKS target (original library) → {library_out}")
+    _log(f"Global NI image root → {DEFAULT_IMAGE_ROOT}")
+    _log(f"Global NI dist_database → {DEFAULT_DIST_DB_ROOT}")
 
     def stage3_progress(frac: float, msg: str) -> None:
         _prog(0.50 + 0.48 * frac, f"Stage 3/3 · {msg}")
@@ -764,9 +793,9 @@ def run_pipeline(
         result.warnings.append(f"{fail} ffmpeg preview job(s) failed.")
 
     _log(
-        f"Done. mirrored={mirrored} previews_ok={ok} fail={fail} missing_audio={missing}"
+        f"Done. processed={mirrored} previews_ok={ok} fail={fail} missing_audio={missing}"
     )
-    _log(f"Library output → {library_out}")
+    _log(f"Library output (in-place) → {library_out}")
     _prog(1.0, "Pipeline complete.")
     return result
 
@@ -849,7 +878,8 @@ class NKSDesktopApp(Tk):
         self.vendor_var = StringVar()
         self.library_var = StringVar()
         self.source_var = StringVar()
-        self.output_var = StringVar(value=str(DEFAULT_OUTPUT))
+        # Auto-target: always mirrors the selected source library absolute path.
+        self.output_var = StringVar(value="(select a source library folder)")
         self.ai_prompt_var = StringVar()
         self.status_var = StringVar(value="Ready.")
         self.ffmpeg_path = resolve_ffmpeg()
@@ -897,13 +927,21 @@ class NKSDesktopApp(Tk):
             self.source_var,
             self._browse_source,
         )
-        self._add_path_row(
-            form,
-            3,
-            "Output NKS User Library Path",
-            self.output_var,
-            self._browse_output,
+        # Output is fully automatic — no Browse. Read-only display of in-place target.
+        ttk.Label(form, text="NKS Output Target (auto)").grid(
+            row=3, column=0, sticky="w", pady=3, padx=(0, 8)
         )
+        self.output_entry = ttk.Entry(form, textvariable=self.output_var, state="readonly")
+        self.output_entry.grid(row=3, column=1, sticky="ew", pady=3, columnspan=2)
+        ttk.Label(
+            form,
+            text=(
+                "Presets & .previews write into the source folder above. "
+                f"Artwork/DB still register under {DEFAULT_NI_ROOT}."
+            ),
+            foreground="#666",
+            wraplength=640,
+        ).grid(row=4, column=1, sticky="w", pady=(0, 4), columnspan=2)
 
         form.columnconfigure(1, weight=1)
 
@@ -1085,15 +1123,25 @@ class NKSDesktopApp(Tk):
         if path:
             self._apply_source_path(path, scan=True)
 
-    def _browse_output(self) -> None:
-        initial = self.output_var.get().strip() or str(DEFAULT_OUTPUT)
-        path = filedialog.askdirectory(
-            parent=self,
-            title="Select Output NKS User Library Path",
-            initialdir=initial if Path(initial).is_dir() else str(APP_DIR),
-        )
-        if path:
-            self.output_var.set(path)
+    def _set_auto_output_target(self, path: str | Path) -> None:
+        """
+        Lock NKS conversion output to the absolute source library path.
+        No manual Browse — presets/.previews deploy in-place here.
+        """
+        p = Path(str(path).strip().strip('"').strip("'")).expanduser()
+        try:
+            if p.is_file():
+                p = p.parent
+            abs_path = str(p.resolve()) if p.exists() else str(p.absolute())
+        except OSError:
+            abs_path = str(p)
+        # readonly Entry needs a brief state flip to update
+        try:
+            self.output_entry.configure(state=NORMAL)
+            self.output_var.set(abs_path)
+            self.output_entry.configure(state="readonly")
+        except Exception:
+            self.output_var.set(abs_path)
 
     def _on_source_path_var_write(self, *_args) -> None:
         """Trace callback: path typed/pasted/dropped into the source field."""
@@ -1109,7 +1157,7 @@ class NKSDesktopApp(Tk):
 
     def _apply_source_path(self, path: str | Path, *, scan: bool = False) -> None:
         """
-        Set the source path, auto-fill Library/Vendor from folder structure,
+        Set the source path, auto-fill Library/Vendor, lock in-place NKS output target,
         optionally kick off artwork scan. Used by Browse and drop handlers.
         """
         path_str = str(path).strip().strip('"').strip("'")
@@ -1126,13 +1174,16 @@ class NKSDesktopApp(Tk):
 
     def _apply_path_metadata(self, path: str | Path, *, force_library: bool = True) -> None:
         """
-        Extract base folder → Library Name, parent/conventions → Vendor Name.
-        Library is always refreshed from the path basename when force_library=True.
-        Vendor is filled whenever a confident guess is available (user may edit after).
+        Extract base folder → Library Name, parent/conventions → Vendor Name,
+        and lock the NKS output target to this absolute path (in-place).
         """
         path_str = str(path).strip().strip('"').strip("'")
         if not path_str:
             return
+
+        # Always sync auto output target to the absolute source path
+        self._set_auto_output_target(path_str)
+
         if path_str == self._source_meta_last_applied and force_library:
             # Still allow re-apply if fields were cleared
             if self.library_var.get().strip() and self.vendor_var.get().strip():
@@ -1155,10 +1206,12 @@ class NKSDesktopApp(Tk):
                     changed.append(f"Vendor Name ← {vendor!r} (guess)")
                 self._last_auto_vendor = vendor
 
+        changed.append(f"NKS target (in-place) ← {self.output_var.get()!r}")
+
         self._source_meta_last_applied = path_str
         if changed:
             self._log("Path metadata: " + "; ".join(changed))
-            self.status_var.set(" · ".join(changed))
+            self.status_var.set(" · ".join(changed[:3]))
 
     def _on_drop_path(self, event) -> str | None:
         """
@@ -1308,14 +1361,19 @@ class NKSDesktopApp(Tk):
         library = self.library_var.get().strip()
         source_raw = self.source_var.get().strip().strip('"').strip("'")
         source = Path(source_raw).expanduser() if source_raw else None
-        output_raw = self.output_var.get().strip()
-        output = Path(output_raw).expanduser() if output_raw else None
 
-        # Last-chance auto-fill from source path before complaining about empty names
+        # Last-chance auto-fill + lock in-place output to absolute source path
         if source is not None and source.exists():
             self._apply_path_metadata(source, force_library=True)
             vendor = self.vendor_var.get().strip()
             library = self.library_var.get().strip()
+            try:
+                source = source.resolve()
+            except OSError:
+                pass
+
+        # Output is always the source library folder (no manual selection).
+        output = source
 
         errors: list[str] = []
         # Name alerts only if still completely empty at the exact moment Build is clicked.
@@ -1325,8 +1383,6 @@ class NKSDesktopApp(Tk):
             errors.append("Library Name is required.")
         if not source or not source.is_dir():
             errors.append("Valid Source Unlicensed Quickload Path is required.")
-        if not output:
-            errors.append("Output NKS User Library Path is required.")
         if not self.ffmpeg_path:
             errors.append("ffmpeg is not available.")
         if self.use_found_artwork.get() and (not self.selected_asset or not self.selected_asset.is_file()):
@@ -1346,8 +1402,10 @@ class NKSDesktopApp(Tk):
         self._log("=" * 60)
         self._log(f"Build started {datetime.now().isoformat(timespec='seconds')}")
         self._log(f"Vendor={vendor!r} Library={library!r}")
-        self._log(f"Source={source}")
-        self._log(f"Output={output}")
+        self._log(f"Source library={source}")
+        self._log(f"NKS output target (in-place)={output}")
+        self._log(f"Global NI image → {DEFAULT_IMAGE_ROOT}")
+        self._log(f"Global NI dist_database → {DEFAULT_DIST_DB_ROOT}")
         self._log(f"App dir={APP_DIR}")
         self.status_var.set("Building…")
 
@@ -1362,7 +1420,7 @@ class NKSDesktopApp(Tk):
                     vendor=vendor,
                     library=library,
                     source_path=source,
-                    output_path=output,
+                    output_path=output,  # same as source; pipeline deploys in-place
                     use_found_artwork=use_found,
                     selected_asset=selected,
                     ai_prompt=prompt,
