@@ -43,3 +43,5 @@ plugin-inventory/
 
 # PyInstaller onedir leftover
 NKS Desktop Builder/
+
+.pytest_cache/
