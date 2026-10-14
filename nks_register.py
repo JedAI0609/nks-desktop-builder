@@ -8,6 +8,7 @@ import subprocess
 import uuid
 from pathlib import Path
 from typing import Callable
+from nks_nicnt import write_nicnt
 
 
 def ensure_dir(path: Path) -> Path:
@@ -68,8 +69,7 @@ def write_service_center_product(vendor: str, library: str) -> Path:
     dest_dir = sc_dir if os.access(sc_dir, os.W_OK) else user_sc
     ensure_dir(dest_dir)
     upid = str(uuid.uuid4())
-    safe = sanitize_segment(f"{vendor}-{library}", "Product")
-    dest = dest_dir / f"{safe}.xml"
+    dest = dest_dir / f"{library}.xml"
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <ProductHints>
   <Product version="1">
@@ -148,6 +148,13 @@ def install_library_for_kontakt_kk(
         root = source_path.expanduser().resolve()
     except OSError:
         root = source_path.expanduser()
+
+    try:
+        nicnt_path = root / f"{library}.nicnt"
+        write_nicnt(nicnt_path, name=library, company=vendor)
+        _log(f"nicnt → {nicnt_path}")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"nicnt write failed: {exc}")
 
     for n in register_user_library_path(root, library):
         _log(f"user_config: {n}")
