@@ -700,13 +700,36 @@ def _audio_dir_priority(path: Path, source_root: Path) -> int:
     return best * 10 + (0 if best < 50 else 10 - depth_bonus)
 
 
+def _is_metadata_or_junk_audio(path: Path) -> bool:
+    """
+    True for macOS / DAW sidecar junk that must never be fed to ffmpeg.
+
+    Filters:
+      - filenames starting with '.' or '_'  (._Foo.wav, _tmp.wav, .hidden.wav)
+      - anything under __MACOSX or AppleDouble '._*' path segments
+      - anything under .previews (generated outputs, not sources)
+    """
+    name = path.name
+    if name.startswith(".") or name.startswith("_"):
+        return True
+    for part in path.parts:
+        if part in {".", ".."}:
+            continue
+        if part == "__MACOSX" or part == ".previews" or part.startswith("._"):
+            return True
+    return False
+
+
 def build_source_audio_index(source_root: Path) -> dict[str, list[Path]]:
     """
     Deep recursive index of all audio under source_root (any nested depth),
     including Samples / Instruments Data / Instruments / …
 
+    Completely ignores files whose names start with '.' or '_' (macOS metadata
+    sidecars) and anything under .previews / hidden path segments.
+
     Keys are lowercased stems; also stores a parallel normalized map via
-    the special key namespace used by pick_matching_wav.
+    the special key namespace used by pick_matching_wav / rank_matching_wavs.
     """
     index: dict[str, list[Path]] = {}
     for path in source_root.rglob("*"):
@@ -717,6 +740,9 @@ def build_source_audio_index(source_root: Path) -> dict[str, list[Path]]:
         # Never treat generated previews as source audio
         if any(part == ".previews" for part in path.parts):
             continue
+        # Ignore macOS / system metadata sidecars (._*, _*, hidden paths)
+        if _is_metadata_or_junk_audio(path):
+            continue
         # Read-only discovery — do not open/alter the file here
         stem_key = path.stem.lower()
         index.setdefault(stem_key, []).append(path)
@@ -726,29 +752,22 @@ def build_source_audio_index(source_root: Path) -> dict[str, list[Path]]:
     return index
 
 
-def pick_matching_wav(
+def rank_matching_wavs(
     stem: str,
     index: dict[str, list[Path]],
     source_root: Path | None = None,
-) -> Path | None:
+) -> list[Path]:
     """
-    Intelligent fuzzy audio discovery for a preset stem.
+    Ordered candidate pool for a preset stem (best first).
 
-    Match order:
-      1. Exact 1:1 stem (case-insensitive)
-      2. Prefix-stripped variants (MB03_Clocks_Loops → Clocks_Loops, …)
-      3. Normalized / partial fuzzy match, preferring files under Samples/
-      4. Closest string similarity among Samples (and other preferred trees)
-      5. Safe fallback: first available .wav in the best Samples segment so a
-         preset is never left without audio when any sample exists in-tree
-
-    Original audio is never modified — path is read-only for ffmpeg -i.
+    Used so ffmpeg can try the next file if one returns "Invalid data found".
+    Never includes metadata sidecars (filtered at index time).
     """
     root = source_root or Path("/")
     ext_rank = {ext: i for i, ext in enumerate(SOURCE_AUDIO_EXTENSIONS)}
-    all_audio = _list_all_audio_paths(index)
+    all_audio = [p for p in _list_all_audio_paths(index) if not _is_metadata_or_junk_audio(p)]
     if not all_audio:
-        return None
+        return []
 
     samples_audio = [p for p in all_audio if _is_under_samples_tree(p, root)]
     preferred_pool = samples_audio or all_audio
@@ -757,9 +776,10 @@ def pick_matching_wav(
     seen: set[str] = set()
 
     def consider(path: Path, similarity: float) -> None:
+        if _is_metadata_or_junk_audio(path):
+            return
         key = str(path)
         if key in seen:
-            # Keep best similarity if re-considered
             return
         seen.add(key)
         scored.append(
@@ -774,7 +794,7 @@ def pick_matching_wav(
     variants = _strip_library_prefixes(stem)
     norms = [_normalize_audio_key(v) for v in variants if _normalize_audio_key(v)]
 
-    # 1–2) Exact + prefix-stripped exact (raw and normalized keys)
+    # 1–2) Exact + prefix-stripped exact
     for v in variants:
         for p in index.get(v.lower(), []):
             consider(p, 1.0)
@@ -783,50 +803,53 @@ def pick_matching_wav(
             for p in index.get(f"norm:{nv}", []):
                 consider(p, 0.98)
 
-    # 3) Partial / fuzzy against inventory (Samples first via scoring)
-    if not scored:
-        for p in preferred_pool:
-            pnorm = _normalize_audio_key(p.stem)
-            best_sim = 0.0
-            for nv in norms:
-                if not nv or len(nv) < 3:
-                    continue
-                if nv == pnorm:
-                    best_sim = max(best_sim, 1.0)
-                elif nv in pnorm or pnorm in nv:
-                    best_sim = max(best_sim, _sequence_similarity(nv, pnorm))
-                else:
-                    best_sim = max(best_sim, _sequence_similarity(nv, pnorm))
-            if best_sim >= 0.34:
-                consider(p, best_sim)
+    # 3) Partial / fuzzy against preferred pool
+    for p in preferred_pool:
+        pnorm = _normalize_audio_key(p.stem)
+        best_sim = 0.0
+        for nv in norms:
+            if not nv or len(nv) < 3:
+                continue
+            if nv == pnorm:
+                best_sim = max(best_sim, 1.0)
+            else:
+                best_sim = max(best_sim, _sequence_similarity(nv, pnorm))
+        if best_sim >= 0.34:
+            consider(p, best_sim)
 
-    # 4) If still nothing, rank entire preferred pool by closest string
-    if not scored:
-        ranked: list[tuple[float, Path]] = []
-        for p in preferred_pool:
-            pnorm = _normalize_audio_key(p.stem)
-            sim = max((_sequence_similarity(nv, pnorm) for nv in norms), default=0.0)
-            ranked.append((sim, p))
-        ranked.sort(key=lambda t: (-t[0], _audio_dir_priority(t[1], root), str(t[1]).lower()))
-        if ranked and ranked[0][0] > 0:
-            consider(ranked[0][1], ranked[0][0])
+    # 4) Closest-string ranking across preferred pool
+    ranked: list[tuple[float, Path]] = []
+    for p in preferred_pool:
+        pnorm = _normalize_audio_key(p.stem)
+        sim = max((_sequence_similarity(nv, pnorm) for nv in norms), default=0.0)
+        ranked.append((sim, p))
+    ranked.sort(key=lambda t: (-t[0], _audio_dir_priority(t[1], root), str(t[1]).lower()))
+    for sim, p in ranked:
+        if sim > 0:
+            consider(p, sim)
 
-    # 5) Guaranteed fallback — never leave a preset without audio if any wav exists
-    if not scored:
-        # Prefer first .wav under Samples tree (stable sort by path), else any audio
-        wavs = [
-            p
-            for p in preferred_pool
-            if p.suffix.lower() in {".wav", ".wave"}
-        ] or preferred_pool
-        wavs_sorted = sorted(
-            wavs,
-            key=lambda p: (_audio_dir_priority(p, root), str(p).lower()),
-        )
-        consider(wavs_sorted[0], 0.01)
+    # 5) Full pool fallback order — every remaining valid wav, Samples first
+    wavs = [
+        p for p in preferred_pool if p.suffix.lower() in {".wav", ".wave"}
+    ] or list(preferred_pool)
+    for p in sorted(wavs, key=lambda p: (_audio_dir_priority(p, root), str(p).lower())):
+        consider(p, 0.01)
+    # Absolute last resort: any audio in the library
+    for p in sorted(all_audio, key=lambda p: (_audio_dir_priority(p, root), str(p).lower())):
+        consider(p, 0.001)
 
     scored.sort()
-    return scored[0][3]
+    return [t[3] for t in scored]
+
+
+def pick_matching_wav(
+    stem: str,
+    index: dict[str, list[Path]],
+    source_root: Path | None = None,
+) -> Path | None:
+    """Best single candidate (first of ranked pool). Prefer rank_matching_wavs for retries."""
+    ranked = rank_matching_wavs(stem, index, source_root=source_root)
+    return ranked[0] if ranked else None
 
 
 def ffmpeg_preview_cmd(ffmpeg: str, src: Path, dst: Path) -> list[str]:
@@ -922,50 +945,95 @@ def mirror_presets_and_previews(
         previews_dir = ensure_dir(dest_preset.parent / ".previews")
         out_ogg = previews_dir / f"{dest_preset.name}.ogg"
 
-        wav = pick_matching_wav(preset.stem, audio_index, source_root=lib_root)
-        if wav is None:
+        candidates = rank_matching_wavs(preset.stem, audio_index, source_root=lib_root)
+        if not candidates:
             missing += 1
             if log:
-                log(f"MISS audio for {preset.name} (searched recursively under library)")
+                log(f"MISS audio for {preset.name} (no valid .wav after metadata filter)")
             if progress:
                 progress((i + 1) / total, f"No audio: {preset.name}")
             continue
 
-        # Safety: never allow ffmpeg output path to equal a source audio/preset path
+        # Safety: never allow ffmpeg output path to equal a source preset path
         try:
-            if out_ogg.resolve() == wav.resolve() or out_ogg.resolve() == preset.resolve():
+            if out_ogg.resolve() == preset.resolve():
                 fail += 1
                 errors.append(f"refusing to overwrite source path for {preset.name}")
                 continue
         except OSError:
             pass
 
-        if log:
+        produced = False
+        last_err = ""
+        for wav in candidates:
+            if _is_metadata_or_junk_audio(wav):
+                continue
             try:
-                wav_rel = wav.relative_to(lib_root)
-            except ValueError:
-                wav_rel = wav
-            log(f"MATCH {preset.name} ← {wav_rel}")
+                if out_ogg.resolve() == wav.resolve():
+                    continue
+            except OSError:
+                pass
 
-        try:
-            # ffmpeg reads `wav` and writes only `out_ogg` under .previews/
-            proc = subprocess.run(
-                ffmpeg_preview_cmd(ffmpeg, wav, out_ogg),
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if proc.returncode == 0 and out_ogg.is_file():
-                ok += 1
+            if log:
+                try:
+                    wav_rel = wav.relative_to(lib_root)
+                except ValueError:
+                    wav_rel = wav
+                log(f"TRY  {preset.name} ← {wav_rel}")
+
+            try:
+                # ffmpeg reads `wav` only; writes exclusively to out_ogg under .previews/
+                proc = subprocess.run(
+                    ffmpeg_preview_cmd(ffmpeg, wav, out_ogg),
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                err = (proc.stderr or proc.stdout or "").strip()
+                if proc.returncode == 0 and out_ogg.is_file() and out_ogg.stat().st_size > 0:
+                    ok += 1
+                    produced = True
+                    if log:
+                        log(f"OK  {out_ogg}  (source untouched: {wav.name})")
+                    break
+
+                last_err = err[:300] or f"exit={proc.returncode}"
+                # Remove empty/partial ogg before trying next candidate
+                try:
+                    if out_ogg.exists() and out_ogg.stat().st_size == 0:
+                        out_ogg.unlink()
+                except OSError:
+                    pass
                 if log:
-                    log(f"OK  {out_ogg}  (source untouched: {wav.name})")
-            else:
-                fail += 1
-                err = (proc.stderr or "").strip()[:300]
-                errors.append(f"ffmpeg failed {preset.name}: exit={proc.returncode} {err}")
-        except OSError as exc:
+                    log(
+                        f"WARN ffmpeg rejected {wav.name} for {preset.name}: {last_err} "
+                        f"— trying next candidate"
+                    )
+            except Exception as exc:  # noqa: BLE001 — never abort whole library run
+                last_err = str(exc)
+                if log:
+                    log(
+                        f"WARN ffmpeg exception on {wav.name} for {preset.name}: {exc} "
+                        f"— trying next candidate"
+                    )
+                try:
+                    if out_ogg.exists() and out_ogg.stat().st_size == 0:
+                        out_ogg.unlink()
+                except OSError:
+                    pass
+                continue
+
+        if not produced:
             fail += 1
-            errors.append(f"ffmpeg spawn failed {preset.name}: {exc}")
+            msg = (
+                f"ffmpeg exhausted candidates for {preset.name}"
+                + (f": {last_err}" if last_err else "")
+            )
+            # Soft failure — do not hard-fail the whole pipeline
+            if log:
+                log(f"FAIL {msg}")
+            # Keep as warning-style error list entry without stopping other presets
+            errors.append(msg)
 
         if progress:
             progress((i + 1) / total, f"Preview {i + 1}/{len(presets)}: {rel}")
@@ -1064,11 +1132,12 @@ def run_pipeline(
     result.previews_created = ok
     result.previews_failed = fail
     result.previews_missing_audio = missing
-    result.errors.extend(errs[:50])
+    # Per-preset ffmpeg issues are soft warnings — never abort the library build
+    result.warnings.extend(errs[:50])
     if missing:
         result.warnings.append(f"{missing} preset(s) had no matching source audio.")
     if fail:
-        result.warnings.append(f"{fail} ffmpeg preview job(s) failed.")
+        result.warnings.append(f"{fail} ffmpeg preview job(s) failed after trying all candidates.")
 
     _log(
         f"Done. processed={mirrored} previews_ok={ok} fail={fail} missing_audio={missing}"
