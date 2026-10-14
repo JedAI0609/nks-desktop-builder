@@ -33,11 +33,11 @@ pytest tests/test_nks_desktop_builder.py -q
 2. Check token stopwords / semantic hints for false positives (e.g. short tokens).
 3. Confirm non-destructive preview path still writes only under `.previews/`.
 4. Flag any missing tests (multi-ext, case, nested Samples).
-5. Note residual gap: real AI artwork API still placeholder.
+5. AI artwork is no longer placeholder-only: OpenAI Images + local fallback are wired (see app v1.2.0).
 
 ## Residual / future
-- Wire generative artwork API (README already marks this).
-- Rebuild `.app` with PyInstaller after matching lands if shipping desktop binary.
+- Rebuild `.app` with PyInstaller after drag-drop / AI artwork lands if shipping desktop binary (`tkinterdnd2` hidden import).
+- Optional: expose model/size controls in the AI artwork UI.
 
 ## Follow-up (2026-10-14 ChatGPT review)
 

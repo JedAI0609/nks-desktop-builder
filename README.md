@@ -34,7 +34,7 @@ cd /Users/fuckem/dev   # or your clone of this repo
 /usr/local/opt/python@3.13/bin/python3.13 -m venv venv-tk
 source venv-tk/bin/activate
 pip install --upgrade pip
-pip install pillow requests pyinstaller
+pip install pillow requests pyinstaller tkinterdnd2
 
 # ffmpeg (if needed)
 brew install ffmpeg
@@ -77,8 +77,13 @@ python nks_preview_bot.py \
    - Guesses **Vendor Name** from the parent path (`Silence & Other Sounds`)
    - Locks **NKS Output Target** to that same absolute path (**in-place** — no separate output browse)
 3. **Scan** finds artwork whose names contain `wallpaper`, `banner`, `folder`, `artwork`, or `icon`
-4. Choose found artwork or enter an **AI Artwork Prompt** (local placeholder generator until you wire a real API)
+4. Choose found artwork **or** open **AI Artwork Generation**:
+   - Enter a prompt + optional **OpenAI API key** (or set `OPENAI_API_KEY` / Save key)
+   - **Generate AI Artwork** calls OpenAI Images (`gpt-image-1`, falls back to `dall-e-3`)
+   - Without a key, **Local placeholder preview** still produces usable NI artwork
 5. Click **Build & Register Library**
+
+**Drag-and-drop:** drop a library folder onto the window, source field, or canvas (requires `tkinterdnd2`). Dropping an image selects it as artwork.
 
 ### What the build does
 
@@ -133,8 +138,8 @@ README.md
 
 - **In-place output**: conversion never asks for a separate “User Content” folder; `.previews` are written beside existing `.nki` / `.nksn` / `.nksf` (and related) presets.
 - **ffmpeg**: this project’s Homebrew build often exposes native `vorbis` (not `libvorbis`). The app uses `-c:a vorbis -strict -2 -ac 2`.
-- **Drag-and-drop**: enabled if `tkinterdnd2` is installed; otherwise use Browse or paste a path.
-- **AI artwork**: placeholder is generated with Pillow; `requests` is available for a future generative API.
+- **Drag-and-drop**: enabled when `tkinterdnd2` is installed (app inherits `TkinterDnD.Tk` and registers the window, source field, and canvas). Otherwise use Browse or paste a path.
+- **AI artwork**: OpenAI Images API via `requests` when an API key is available (`OPENAI_API_KEY`, saved `.nks_desktop_builder.json`, or the UI field). Falls back to a local Pillow placeholder. Generated masters are cached under `.nks_ai_cache/` and formatted into the full modern NKS2 + classic NI image set.
 - **Preview audio matching**: presets are paired to source WAVs using filename similarity plus Samples-subfolder/token scoring (e.g. “loop/clock” → timing folders). Unrelated presets do **not** fall back to a random first sample.
 - **Safe audio gate**: candidates must exist, be non-empty, and (when `ffprobe` is available) decode as audio before preview encode.
 

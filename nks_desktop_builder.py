@@ -16,10 +16,13 @@ import os
 import queue
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
 import traceback
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,13 +54,28 @@ from typing import Callable, Iterable
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps, ImageTk
 
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD  # type: ignore
+
+    _HAS_TKDND = True
+    _AppTkBase = TkinterDnD.Tk
+except ImportError:  # pragma: no cover - optional desktop dependency
+    DND_FILES = "DND_Files"
+    TkinterDnD = None  # type: ignore
+    _HAS_TKDND = False
+    _AppTkBase = Tk
+
 # ---------------------------------------------------------------------------
 # Paths / constants (explicit project + NI roots)
 # ---------------------------------------------------------------------------
 
 APP_DIR = Path("/Users/fuckem/dev").resolve()
 APP_TITLE = "NKS Desktop Builder"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
+APP_CONFIG_PATH = APP_DIR / ".nks_desktop_builder.json"
+AI_ARTWORK_SIZE = (1024, 1024)
+OPENAI_IMAGES_URL = "https://api.openai.com/v1/images/generations"
+OPENAI_IMAGE_MODEL = "gpt-image-1"
 
 DEFAULT_NI_ROOT = Path("/Users/Shared/NI Resources")
 DEFAULT_IMAGE_ROOT = DEFAULT_NI_ROOT / "image"
@@ -503,6 +521,225 @@ def generate_placeholder_artwork(
     return base
 
 
+def load_app_config(path: Path | None = None) -> dict:
+    cfg_path = path if path is not None else APP_CONFIG_PATH
+    try:
+        if cfg_path.is_file():
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def save_app_config(data: dict, path: Path | None = None) -> None:
+    cfg_path = path if path is not None else APP_CONFIG_PATH
+    merged = load_app_config(cfg_path)
+    merged.update(data)
+    cfg_path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+    try:
+        cfg_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+
+
+def resolve_openai_api_key(explicit: str | None = None) -> str | None:
+    """Resolve OpenAI key from explicit value, env, or local app config."""
+    for candidate in (
+        (explicit or "").strip(),
+        (os.environ.get("OPENAI_API_KEY") or "").strip(),
+        str(load_app_config().get("openai_api_key") or "").strip(),
+    ):
+        if candidate:
+            return candidate
+    return None
+
+
+def parse_drop_paths(data: str | None) -> list[str]:
+    """
+    Parse TkDnD / Finder drop payloads into filesystem paths.
+
+    Handles brace-wrapped paths with spaces, file:// URLs, and multi-drop lists.
+    """
+    if not data:
+        return []
+    raw = str(data).strip()
+    if not raw:
+        return []
+    tokens = re.findall(r"\{([^}]*)\}|(\S+)", raw)
+    paths: list[str] = []
+    seen: set[str] = set()
+    for braced, plain in tokens:
+        token = (braced or plain or "").strip().strip('"').strip("'")
+        if not token:
+            continue
+        if token.lower().startswith("file://"):
+            from urllib.parse import unquote, urlparse
+
+            parsed = urlparse(token)
+            token = unquote(parsed.path or "")
+            # file://localhost/Users/... → /Users/...
+            if token.startswith("/localhost/"):
+                token = token[len("/localhost") :]
+        if token and token not in seen:
+            seen.add(token)
+            paths.append(token)
+    return paths
+
+
+def compose_ai_image_prompt(prompt: str, vendor: str, library: str) -> str:
+    body = (prompt or "").strip() or f"{library} instrument library artwork"
+    vendor_s = (vendor or "").strip()
+    library_s = (library or "").strip()
+    extras = []
+    if library_s and library_s.lower() not in body.lower():
+        extras.append(f"library name '{library_s}'")
+    if vendor_s and vendor_s.lower() not in body.lower():
+        extras.append(f"by {vendor_s}")
+    suffix = (
+        "Cinematic Native Instruments / Kontakt product artwork, wide banner composition, "
+        "high-end music software packaging, no watermarks, no UI chrome, no unreadable text."
+    )
+    if extras:
+        return f"{body}. Theme: {', '.join(extras)}. {suffix}"
+    return f"{body}. {suffix}"
+
+
+def _decode_openai_image_payload(payload: dict) -> Image.Image:
+    """Decode OpenAI Images API response (b64_json or url) into a PIL image."""
+    import base64
+    import io
+    import urllib.request
+
+    data = payload.get("data") or []
+    if not data:
+        raise RuntimeError("OpenAI images response contained no data entries")
+    entry = data[0] or {}
+    b64 = entry.get("b64_json")
+    if b64:
+        raw = base64.b64decode(b64)
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        return img.convert("RGBA")
+    url = entry.get("url")
+    if url:
+        with urllib.request.urlopen(url, timeout=60) as resp:  # noqa: S310 — OpenAI CDN URL
+            raw = resp.read()
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        return img.convert("RGBA")
+    raise RuntimeError("OpenAI images response missing b64_json and url")
+
+
+def generate_openai_artwork(
+    prompt: str,
+    vendor: str,
+    library: str,
+    *,
+    api_key: str,
+    size: tuple[int, int] = AI_ARTWORK_SIZE,
+    model: str = OPENAI_IMAGE_MODEL,
+    timeout: float = 120.0,
+) -> Image.Image:
+    """Call OpenAI Images API and return a PIL image."""
+    import requests
+
+    full_prompt = compose_ai_image_prompt(prompt, vendor, library)
+    # gpt-image-1 accepts 1024x1024 / 1536x1024 / 1024x1536 / auto
+    w, h = size
+    if (w, h) == (1024, 1024):
+        size_s = "1024x1024"
+    elif w >= h:
+        size_s = "1536x1024"
+    else:
+        size_s = "1024x1536"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": model,
+        "prompt": full_prompt,
+        "size": size_s,
+        "n": 1,
+    }
+    # Prefer base64 so we do not depend on a second download when available.
+    if model.startswith("dall-e"):
+        body["response_format"] = "b64_json"
+        body["model"] = "dall-e-3"
+        body["size"] = "1792x1024" if w >= h else "1024x1792"
+        body["quality"] = "standard"
+    else:
+        body["output_format"] = "png"
+
+    resp = requests.post(OPENAI_IMAGES_URL, headers=headers, json=body, timeout=timeout)
+    if resp.status_code >= 400:
+        # Fall back to dall-e-3 once if the preferred model is unavailable.
+        detail = resp.text[:400]
+        if model != "dall-e-3" and resp.status_code in {400, 404}:
+            return generate_openai_artwork(
+                prompt,
+                vendor,
+                library,
+                api_key=api_key,
+                size=size,
+                model="dall-e-3",
+                timeout=timeout,
+            )
+        raise RuntimeError(f"OpenAI images HTTP {resp.status_code}: {detail}")
+    return _decode_openai_image_payload(resp.json())
+
+
+def generate_artwork_from_prompt(
+    prompt: str,
+    vendor: str,
+    library: str,
+    *,
+    api_key: str | None = None,
+    prefer_api: bool = True,
+    size: tuple[int, int] = AI_ARTWORK_SIZE,
+    log: Callable[[str], None] | None = None,
+) -> tuple[Image.Image, str]:
+    """
+    Generate master artwork for NI formatting.
+
+    Returns (image, source) where source is "openai", "openai:dall-e-3", or "placeholder".
+    """
+
+    def _log(msg: str) -> None:
+        if log:
+            log(msg)
+
+    key = resolve_openai_api_key(api_key)
+    if prefer_api and key:
+        try:
+            img = generate_openai_artwork(prompt, vendor, library, api_key=key, size=size)
+            _log("AI artwork generated via OpenAI Images API")
+            return img.convert("RGBA"), "openai"
+        except Exception as exc:  # noqa: BLE001
+            _log(f"OpenAI artwork failed ({exc}); falling back to local placeholder")
+    elif prefer_api and not key:
+        _log("No OpenAI API key — using local placeholder artwork")
+
+    return generate_placeholder_artwork(prompt, vendor, library, size=size), "placeholder"
+
+
+def save_master_artwork_cache(
+    image: Image.Image,
+    vendor: str,
+    library: str,
+    dest_dir: Path | None = None,
+) -> Path:
+    """Persist a generated master image so the pipeline can reuse it as selected_asset."""
+    root = dest_dir or (APP_DIR / ".nks_ai_cache")
+    ensure_dir(root)
+    name = f"{slugify(vendor)}_{slugify(library)}_{uuid.uuid4().hex[:8]}.png"
+    path = root / name
+    image.convert("RGBA").save(path, format="PNG", optimize=True)
+    return path
+
+
 def fit_cover(img: Image.Image, size: tuple[int, int]) -> Image.Image:
     return ImageOps.fit(
         img.convert("RGBA"),
@@ -810,9 +1047,10 @@ def _strip_library_prefixes(stem: str) -> list[str]:
     add(raw)
     peeled = raw
     for _ in range(4):
-        # Require a digit so descriptive words (Soft_, Dark_, Bright_) are kept.
+        # Only compact uppercase codes, known lowercase code prefixes, or
+        # numeric indices qualify; descriptive words such as Phase2 are kept.
         m = re.match(
-            r"^(?:[A-Za-z]{1,8}\d{1,4}|\d{1,4}[A-Za-z]{0,4})[_\-\.]+(.+)$",
+            r"^(?:[A-Z]{1,4}\d{1,4}|(?i:mb|lib)\d{1,4}|\d{1,4})[_\-\.]+(.+)$",
             peeled,
         )
         if not m:
@@ -820,14 +1058,6 @@ def _strip_library_prefixes(stem: str) -> list[str]:
         peeled = m.group(1)
         add(peeled)
 
-    parts = re.split(r"[_\-]+", raw)
-    if len(parts) >= 2:
-        # Only peel first segment when it looks like a library code (has a digit).
-        if re.search(r"\d", parts[0]):
-            add("_".join(parts[1:]))
-            add(" ".join(parts[1:]))
-            if len(parts[-1]) >= 4:
-                add(parts[-1])
     return variants
 
 
@@ -837,20 +1067,14 @@ def _preset_tokens(stem: str) -> list[str]:
     e.g. MB03_Clocks_Loops.nki → ['clocks', 'loops'] (MB03 dropped as code prefix).
     """
     variants = _strip_library_prefixes(stem)
-    # Tokenize the original stem (and lightly stripped code prefixes), not the
-    # most aggressively shortened tail — keeps Soft_Piano → soft+piano.
-    base = variants[0] if variants else (stem or "")
-    if len(variants) > 1 and re.search(r"\d", variants[0].split("_")[0] if variants[0] else ""):
-        base = variants[1]
+    # Variants only remove identifiable leading codes, never descriptive tails.
+    base = variants[-1] if variants else (stem or "")
     raw_parts = re.split(r"[^A-Za-z0-9]+", base)
     tokens: list[str] = []
     seen: set[str] = set()
     for part in raw_parts:
         t = part.strip().lower()
         if not t or len(t) < 2:
-            continue
-        # Drop pure library codes like mb03, a1, v2 if short alnum mix
-        if re.fullmatch(r"[a-z]{0,4}\d{1,4}[a-z]{0,2}", t) and t not in _FOLDER_SEMANTIC_HINTS:
             continue
         if t in _TOKEN_STOPWORDS:
             continue
@@ -996,6 +1220,7 @@ def _token_evidence_breakdown(
     if not tokens:
         return 0.0, 0.0, False
     name_norm = _normalize_audio_key(path.stem)
+    name_tokens = set(re.findall(r"[a-z0-9]+", path.stem.lower()))
     labels = _samples_subfolder_labels(path, source_root)
     label_blob = " ".join(labels)
     hit = 0
@@ -1004,10 +1229,7 @@ def _token_evidence_breakdown(
     for tok in tokens:
         tn = _normalize_audio_key(tok)
         ok = False
-        if tn and len(tn) >= 3 and (
-            tn == name_norm
-            or (len(tn) >= 4 and tn in name_norm and len(tn) / max(len(name_norm), 1) >= 0.5)
-        ):
+        if tn and (tn == name_norm or tok in name_tokens):
             ok = True
             file_hit += 1
         elif tok in label_blob or any(tok in lab or lab in tok for lab in labels if len(lab) >= 3):
@@ -1086,10 +1308,10 @@ def _is_metadata_or_junk_audio(path: Path) -> bool:
     return False
 
 
-_SAFE_AUDIO_CACHE: dict[tuple[str, int, int], bool] = {}
+AudioValidationCache = dict[tuple[str, int, int, int, int], bool]
 
 
-def is_safe_audio_file(path: Path) -> bool:
+def is_safe_audio_file(path: Path, *, cache: AudioValidationCache | None = None) -> bool:
     """
     Pre-flight check before ffmpeg:
       - exists, is file
@@ -1097,21 +1319,22 @@ def is_safe_audio_file(path: Path) -> bool:
       - size > 0 bytes
       - optional container sniff via ffprobe when available
 
-    Results are cached per (resolved path, mtime_ns, size) so large libraries
-    do not re-ffprobe the same file once per preset.
+    An explicitly supplied cache is owned by one preview run, never global.
+    Without ffprobe, basic checks defer final validation to the encoder.
+    An installed probe that fails or times out rejects the candidate.
     """
     try:
         st = path.stat()
-        cache_key = (str(path.resolve()), int(getattr(st, "st_mtime_ns", st.st_mtime * 1e9)), int(st.st_size))
+        cache_key = (str(path.resolve()), st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino)
     except OSError:
         return False
 
-    cached = _SAFE_AUDIO_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
 
     ok = _is_safe_audio_file_uncached(path)
-    _SAFE_AUDIO_CACHE[cache_key] = ok
+    if cache is not None:
+        cache[cache_key] = ok
     return ok
 
 
@@ -1150,20 +1373,11 @@ def _is_safe_audio_file_uncached(path: Path) -> bool:
                 timeout=8,
             )
             out = (proc.stdout or "").lower()
-            err = (proc.stderr or "").lower()
-            if proc.returncode != 0:
+            # A recognized container without an audio stream is not audio.
+            if proc.returncode != 0 or "audio" not in out.split():
                 return False
-            if "invalid" in err or "error" in err and "not found" not in err:
-                # soft: still allow if stdout looks like audio
-                if "audio" not in out:
-                    return False
-            if out and "audio" not in out and "wav" not in out and "aiff" not in out:
-                # format line might just be "wav" without stream lines depending on build
-                if not any(x in out for x in ("wav", "aiff", "mp3", "flac", "ogg", "mov", "mp4")):
-                    return False
         except (OSError, subprocess.TimeoutExpired):
-            # If ffprobe unavailable/hangs, size checks already passed
-            pass
+            return False
     return True
 
 
@@ -1191,7 +1405,7 @@ def build_source_audio_index(source_root: Path) -> dict[str, list[Path]]:
         stem_key = path.stem.lower()
         index.setdefault(stem_key, []).append(path)
         norm = _normalize_audio_key(path.stem)
-        if norm and norm != stem_key:
+        if norm:
             index.setdefault(f"norm:{norm}", []).append(path)
     return index
 
@@ -1200,6 +1414,8 @@ def rank_matching_wavs(
     stem: str,
     index: dict[str, list[Path]],
     source_root: Path | None = None,
+    *,
+    validation_cache: AudioValidationCache | None = None,
 ) -> list[Path]:
     """
     Strict priority audio mapping (NO random first-available fallback):
@@ -1210,32 +1426,33 @@ def rank_matching_wavs(
       4. Samples/ subfolder alignment only as a *secondary* signal
       5. Drop weak / folder-only / short-substring false positives
 
-    Each candidate is size/legitimacy-checked via is_safe_audio_file().
+    Heuristics require every meaningful preset token in the filename.
+    Each candidate is checked via is_safe_audio_file(), using a run-owned cache.
     """
     root = source_root or Path("/")
+    cache = validation_cache if validation_cache is not None else {}
     ext_rank = {ext: i for i, ext in enumerate(SOURCE_AUDIO_EXTENSIONS)}
     all_audio = [
         p
         for p in _list_all_audio_paths(index)
-        if not _is_metadata_or_junk_audio(p) and is_safe_audio_file(p)
+        if not _is_metadata_or_junk_audio(p) and is_safe_audio_file(p, cache=cache)
     ]
     if not all_audio:
         return []
 
-    samples_audio = [p for p in all_audio if _is_under_samples_tree(p, root)]
-    search_pool = samples_audio if samples_audio else all_audio
+    search_pool = all_audio
 
     tokens = _preset_tokens(stem)
     variants = _strip_library_prefixes(stem)
     norms = [_normalize_audio_key(v) for v in variants if _normalize_audio_key(v)]
 
     # tuple: (tier, -total, -name, -file, -folder, dir_pri, ext_pri, path)
-    # tier 0 = exact/near-exact name; tier 1 = strong relevance; never folder-only.
+    # Full exact, full normalized, stripped exact, stripped normalized, heuristic.
     scored: list[tuple[int, float, float, float, float, int, int, Path]] = []
     seen: set[str] = set()
 
-    def consider(path: Path, base_sim: float, *, exact_lane: bool) -> None:
-        if _is_metadata_or_junk_audio(path) or not is_safe_audio_file(path):
+    def consider(path: Path, base_sim: float, *, match_tier: int = 4) -> None:
+        if _is_metadata_or_junk_audio(path) or not is_safe_audio_file(path, cache=cache):
             return
         key = str(path)
         if key in seen:
@@ -1243,34 +1460,18 @@ def rank_matching_wavs(
         folder_sc = _folder_token_score(tokens, path, root)
         file_sc = _filename_token_score(tokens, path)
 
-        if exact_lane or base_sim >= 0.95:
-            # Exact/near-exact names dominate regardless of folder affinity.
-            tier = 0
+        tier = match_tier
+        if tier < 4:
             total = 10.0 + base_sim + 0.15 * file_sc + 0.05 * folder_sc
         else:
             # Relevance gate: block weak substring and single-shared-token hits.
             # Examples rejected: Air→Chair, Soft_Piano→Harsh_Piano (only "piano"),
             # MB03_Clocks_Loops→Loops/Alien.wav (folder token only, alien name).
-            evidence, file_ratio, semantic_hit = _token_evidence_breakdown(tokens, path, root)
-            strong_name = base_sim >= 0.72
-            # Semantic folder (clocks→timing) may pair without filename overlap.
-            # Literal folder token only (loops→Loops/Alien.wav) is not enough.
-            semantic_folder = semantic_hit and folder_sc >= 0.4 and evidence >= 0.5
-            # Majority token evidence via filename AND/OR Samples folder labels
-            # (PainPiano_STABS_CLUSTERS → folder Clusters_Stabs without file stem hit).
-            majority = evidence >= 0.67 and (file_ratio >= 0.34 or folder_sc >= 0.5)
-            if not (strong_name or majority or semantic_folder):
+            evidence, file_ratio, _ = _token_evidence_breakdown(tokens, path, root)
+            # All meaningful preset tokens must occur in the filename itself.
+            # Folders may rank candidates, never authorize one.
+            if file_ratio < 1.0:
                 return
-            # Soft_Piano vs Harsh_Piano: shared category token, weak whole-name sim.
-            if (
-                len(tokens) <= 2
-                and base_sim < 0.55
-                and file_sc < 0.95
-                and evidence < 1.0
-                and not semantic_folder
-            ):
-                return
-            tier = 1
             total = base_sim + 0.85 * file_sc + 0.35 * folder_sc + 0.4 * evidence
 
         seen.add(key)
@@ -1288,13 +1489,15 @@ def rank_matching_wavs(
         )
 
     # --- Priority 1: exact / stripped exact names ---
-    for v in variants:
+    # Visit full exact/normalized before any code-stripped alternatives.
+    for i, v in enumerate(variants):
+        tier = 0 if i == 0 else 2
         for p in index.get(v.lower(), []):
-            consider(p, 1.0, exact_lane=True)
+            consider(p, 1.0, match_tier=tier)
         nv = _normalize_audio_key(v)
         if nv:
             for p in index.get(f"norm:{nv}", []):
-                consider(p, 0.98, exact_lane=True)
+                consider(p, 0.98, match_tier=tier + 1)
 
     # --- Priority 2–3: name similarity + token relevance ---
     for p in search_pool:
@@ -1311,7 +1514,7 @@ def rank_matching_wavs(
                 best = max(best, 0.75 if ratio >= 0.5 else 0.2)
             else:
                 best = max(best, _sequence_similarity(nv, pnorm))
-        consider(p, best, exact_lane=False)
+        consider(p, best)
 
     scored.sort()
     return [t[7] for t in scored]
@@ -1336,7 +1539,7 @@ def ffmpeg_preview_cmd(ffmpeg: str, src: Path, dst: Path) -> list[str]:
     # and stereo (-ac 2). Falls back cleanly for NKS-style .ogg previews.
     return [
         ffmpeg,
-        "-y",  # overwrite only the destination .ogg if re-run
+        "-y",  # pipeline writes only its exclusive staging file
         "-hide_banner",
         "-loglevel",
         "error",
@@ -1367,6 +1570,94 @@ class PipelineResult:
     previews_missing_audio: int = 0
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+
+@contextmanager
+def _preview_directory(lib_root: Path, preset: Path):
+    """Open destination components without following symlinks.
+
+    Creation and replacement use a pinned directory descriptor, not a path
+    that can be redirected by swapping a .previews symlink during conversion.
+    """
+    directory = preset.parent / ".previews"
+    directory.resolve().relative_to(lib_root)
+    parts = preset.parent.relative_to(lib_root).parts
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(lib_root, flags)
+    try:
+        for part in parts:
+            next_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        try:
+            os.mkdir(".previews", dir_fd=fd)
+        except FileExistsError:
+            pass
+        next_fd = os.open(".previews", flags, dir_fd=fd)
+        os.close(fd)
+        fd = next_fd
+        _check_preview_destination(fd, f"{preset.name}.ogg")
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _check_preview_destination(directory_fd: int, name: str) -> None:
+    try:
+        mode = os.stat(name, dir_fd=directory_fd, follow_symlinks=False).st_mode
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(mode):
+        raise ValueError(f"refusing symlink or non-file preview destination: {name}")
+
+
+def _encode_preview_candidate(
+    lib_root: Path, preset: Path, ffmpeg: str, audio: Path
+) -> tuple[bool, str]:
+    """Encode into an exclusive temporary file, then atomically publish it."""
+    with _preview_directory(lib_root, preset) as directory_fd:
+        temp_name = f".preview-{uuid.uuid4().hex}.ogg"
+        stage_fd = os.open(
+            temp_name, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW,
+            0o600, dir_fd=directory_fd,
+        )
+        try:
+            # Inherit the open file, not its mutable path. Explicit format is
+            # needed because /dev/fd/N does not have an .ogg extension.
+            cmd = ffmpeg_preview_cmd(ffmpeg, audio, Path(f"/dev/fd/{stage_fd}"))
+            cmd[-1:-1] = ["-f", "ogg"]
+            proc = subprocess.run(
+                cmd, check=False, capture_output=True, text=True,
+                pass_fds=(stage_fd,),
+            )
+            if proc.returncode != 0 or os.fstat(stage_fd).st_size == 0:
+                err = proc.stderr or proc.stdout or f"exit={proc.returncode}; empty output"
+                return False, err.strip()[:300]
+            staged = os.stat(temp_name, dir_fd=directory_fd, follow_symlinks=False)
+            opened = os.fstat(stage_fd)
+            if (
+                not stat.S_ISREG(staged.st_mode)
+                or (staged.st_dev, staged.st_ino) != (opened.st_dev, opened.st_ino)
+            ):
+                raise ValueError("preview staging file changed during conversion")
+            with _preview_directory(lib_root, preset) as current_fd:
+                current = os.fstat(current_fd)
+                original = os.fstat(directory_fd)
+                if (current.st_dev, current.st_ino) != (
+                    original.st_dev, original.st_ino
+                ):
+                    raise ValueError("preview directory changed during conversion")
+                os.replace(
+                    temp_name, f"{preset.name}.ogg",
+                    src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+                )
+            return True, ""
+        finally:
+            os.close(stage_fd)
+            try:
+                os.unlink(temp_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
 
 
 def mirror_presets_and_previews(
@@ -1402,6 +1693,7 @@ def mirror_presets_and_previews(
         log(f"Deep audio scan under {lib_root} (includes Samples / Instruments Data / …)")
 
     audio_index = build_source_audio_index(lib_root)
+    validation_cache: AudioValidationCache = {}
     audio_file_count = sum(len(v) for k, v in audio_index.items() if not k.startswith("norm:"))
     presets = list(iter_preset_files(lib_root))
     total = max(len(presets), 1)
@@ -1417,26 +1709,28 @@ def mirror_presets_and_previews(
         processed += 1
         rel = preset.relative_to(lib_root)
 
-        previews_dir = ensure_dir(dest_preset.parent / ".previews")
+        previews_dir = dest_preset.parent / ".previews"
         out_ogg = previews_dir / f"{dest_preset.name}.ogg"
 
-        # Containment: refuse to write if .previews resolves outside the library
-        # (e.g. a symlinked .previews directory pointing elsewhere).
+        # Check containment and reject symlinks before creating or encoding.
         try:
-            previews_resolved = previews_dir.resolve()
-            out_resolved = out_ogg.resolve()
-            previews_resolved.relative_to(lib_root)
-            out_resolved.relative_to(lib_root)
-        except (OSError, ValueError):
+            with _preview_directory(lib_root, preset):
+                pass
+        except (OSError, ValueError, RuntimeError) as exc:
             fail += 1
             errors.append(
-                f"refusing preview path outside library for {preset.name}: {previews_dir}"
+                f"refusing unsafe preview path for {preset.name}: {previews_dir}: {exc}"
             )
             if log:
-                log(f"SKIP {preset.name}: .previews path escapes library root")
+                log(f"SKIP {preset.name}: unsafe .previews destination: {exc}")
+            if progress:
+                progress((i + 1) / total, f"Unsafe preview path: {preset.name}")
             continue
 
-        candidates = rank_matching_wavs(preset.stem, audio_index, source_root=lib_root)
+        candidates = rank_matching_wavs(
+            preset.stem, audio_index, source_root=lib_root,
+            validation_cache=validation_cache,
+        )
         if not candidates:
             missing += 1
             if log:
@@ -1473,28 +1767,15 @@ def mirror_presets_and_previews(
                 log(f"TRY  {preset.name} ← {wav_rel}")
 
             try:
-                # ffmpeg reads `wav` only; writes exclusively to out_ogg under .previews/
-                proc = subprocess.run(
-                    ffmpeg_preview_cmd(ffmpeg, wav, out_ogg),
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                )
-                err = (proc.stderr or proc.stdout or "").strip()
-                if proc.returncode == 0 and out_ogg.is_file() and out_ogg.stat().st_size > 0:
+                converted, err = _encode_preview_candidate(lib_root, preset, ffmpeg, wav)
+                if converted:
                     ok += 1
                     produced = True
                     if log:
                         log(f"OK  {out_ogg}  (source untouched: {wav.name})")
                     break
 
-                last_err = err[:300] or f"exit={proc.returncode}"
-                # Remove empty/partial ogg before trying next candidate
-                try:
-                    if out_ogg.exists() and out_ogg.stat().st_size == 0:
-                        out_ogg.unlink()
-                except OSError:
-                    pass
+                last_err = err[:300]
                 if log:
                     log(
                         f"WARN ffmpeg rejected {wav.name} for {preset.name}: {last_err} "
@@ -1507,11 +1788,6 @@ def mirror_presets_and_previews(
                         f"WARN ffmpeg exception on {wav.name} for {preset.name}: {exc} "
                         f"— trying next candidate"
                     )
-                try:
-                    if out_ogg.exists() and out_ogg.stat().st_size == 0:
-                        out_ogg.unlink()
-                except OSError:
-                    pass
                 continue
 
         if not produced:
@@ -1544,6 +1820,8 @@ def run_pipeline(
     ffmpeg: str,
     log: Callable[[str], None] | None = None,
     progress: Callable[[float, str], None] | None = None,
+    openai_api_key: str | None = None,
+    prefer_ai_api: bool = True,
 ) -> PipelineResult:
     result = PipelineResult()
     vendor_s = sanitize_segment(vendor, "Vendor")
@@ -1565,8 +1843,15 @@ def run_pipeline(
             master.load()
             _log(f"Using found artwork: {selected_asset}")
         else:
-            master = generate_placeholder_artwork(ai_prompt, vendor_s, library_s)
-            _log("Generated placeholder / AI-description artwork")
+            master, art_source = generate_artwork_from_prompt(
+                ai_prompt,
+                vendor_s,
+                library_s,
+                api_key=openai_api_key,
+                prefer_api=prefer_ai_api,
+                log=_log,
+            )
+            _log(f"Artwork source: {art_source}")
 
         # Install into flat library folder (Kontakt/KK primary) + vendor path (compat).
         install_dirs = ni_image_install_dirs(vendor_s, library_s)
@@ -1742,12 +2027,12 @@ class ArtworkChoiceDialog(Toplevel):
 # ---------------------------------------------------------------------------
 
 
-class NKSDesktopApp(Tk):
+class NKSDesktopApp(_AppTkBase):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"{APP_TITLE} v{APP_VERSION}")
-        self.minsize(820, 720)
-        self.geometry("920x780")
+        self.minsize(860, 820)
+        self.geometry("960x880")
 
         # State
         self.vendor_var = StringVar()
@@ -1756,6 +2041,7 @@ class NKSDesktopApp(Tk):
         # Auto-target: always mirrors the selected source library absolute path.
         self.output_var = StringVar(value="(select a source library folder)")
         self.ai_prompt_var = StringVar()
+        self.openai_key_var = StringVar(value=resolve_openai_api_key() or "")
         self.status_var = StringVar(value="Ready.")
         self.ffmpeg_path = resolve_ffmpeg()
 
@@ -1764,7 +2050,10 @@ class NKSDesktopApp(Tk):
         self.use_found_artwork = BooleanVar(value=False)
         self._photo_ref: ImageTk.PhotoImage | None = None  # prevent GC
         self._build_thread: threading.Thread | None = None
+        self._ai_thread: threading.Thread | None = None
         self._ui_queue: queue.Queue = queue.Queue()
+        self.source_entry: ttk.Entry | None = None
+        self._dnd_targets: list = []
 
         self._build_ui()
         self._set_ffmpeg_status()
@@ -1848,21 +2137,44 @@ class NKSDesktopApp(Tk):
         self.canvas.create_text(
             PREVIEW_CANVAS_W // 2,
             PREVIEW_CANVAS_H // 2,
-            text="No artwork loaded — choose a Quickload path and Scan",
+            text="No artwork loaded — drop a folder here, Browse, or Scan",
             fill="#8b93a7",
             font=("Helvetica", 12),
             tags=("placeholder",),
         )
 
         # --- AI prompt (shown when needed) ---
-        self.prompt_frame = ttk.LabelFrame(root, text="AI Artwork Prompt", padding=8)
+        self.prompt_frame = ttk.LabelFrame(root, text="AI Artwork Generation", padding=8)
         self.prompt_frame.pack(fill=X, pady=(0, 10))
-        ttk.Entry(self.prompt_frame, textvariable=self.ai_prompt_var).pack(fill=X)
+        ttk.Label(self.prompt_frame, text="Prompt").pack(anchor="w")
+        ttk.Entry(self.prompt_frame, textvariable=self.ai_prompt_var).pack(fill=X, pady=(0, 6))
+        key_row = ttk.Frame(self.prompt_frame)
+        key_row.pack(fill=X, pady=(0, 6))
+        ttk.Label(key_row, text="OpenAI API key").pack(side=LEFT)
+        ttk.Entry(key_row, textvariable=self.openai_key_var, show="•", width=42).pack(
+            side=LEFT, padx=8, fill=X, expand=True
+        )
+        ttk.Button(key_row, text="Save key", command=self._save_openai_key).pack(side=LEFT)
+        ai_btns = ttk.Frame(self.prompt_frame)
+        ai_btns.pack(fill=X)
+        self.generate_ai_btn = ttk.Button(
+            ai_btns,
+            text="Generate AI Artwork",
+            command=self.start_ai_artwork_generation,
+        )
+        self.generate_ai_btn.pack(side=LEFT)
+        ttk.Button(ai_btns, text="Local placeholder preview", command=self._preview_placeholder_artwork).pack(
+            side=LEFT, padx=8
+        )
         ttk.Label(
             self.prompt_frame,
-            text="Used when no artwork is found, or when you choose custom description artwork.",
+            text=(
+                "Uses OpenAI Images when a key is set (env OPENAI_API_KEY, saved key, or field). "
+                "Falls back to a local placeholder. Generate Preview installs the image for Build."
+            ),
             foreground="#666",
-        ).pack(anchor="w", pady=(4, 0))
+            wraplength=820,
+        ).pack(anchor="w", pady=(6, 0))
         # Hidden until scan decides — still pack but we'll toggle state
         self._set_prompt_visible(True)
 
@@ -1909,7 +2221,10 @@ class NKSDesktopApp(Tk):
         browse_cmd: Callable[[], None],
     ) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3, padx=(0, 8))
-        ttk.Entry(parent, textvariable=var).grid(row=row, column=1, sticky="ew", pady=3)
+        entry = ttk.Entry(parent, textvariable=var)
+        entry.grid(row=row, column=1, sticky="ew", pady=3)
+        if label.startswith("Source"):
+            self.source_entry = entry
         ttk.Button(parent, text="Browse…", command=browse_cmd).grid(row=row, column=2, padx=(6, 0), pady=3)
 
     def _set_prompt_visible(self, visible: bool) -> None:
@@ -1982,6 +2297,10 @@ class NKSDesktopApp(Tk):
                     self._on_build_done(result)
                 elif kind == "error":
                     self._on_build_error(item[1])
+                elif kind == "ai_done":
+                    self._on_ai_artwork_done(item[1], item[2], item[3])
+                elif kind == "ai_error":
+                    self._on_ai_artwork_error(item[1])
         except queue.Empty:
             pass
         self.after(120, self._drain_ui_queue)
@@ -2090,34 +2409,147 @@ class NKSDesktopApp(Tk):
 
     def _on_drop_path(self, event) -> str | None:
         """
-        Optional drag-and-drop handler (TkDnD / macOS file drops).
-        Expects event.data to contain one or more paths.
+        Drag-and-drop handler (TkDnD / Finder).
+        Folders become the source library; image files become selected artwork.
         """
-        data = getattr(event, "data", None) or ""
-        if not data:
-            return None
-        # TkDnD may brace-wrap paths with spaces: {/path/with spaces}
-        tokens = re.findall(r"\{([^}]*)\}|(\S+)", str(data))
-        paths = [a or b for a, b in tokens]
+        paths = parse_drop_paths(getattr(event, "data", None))
         if not paths:
-            return None
-        dropped = paths[0].strip().strip('"').strip("'")
-        if dropped:
-            self._apply_source_path(dropped, scan=True)
+            return event.action if hasattr(event, "action") else None
+
+        dropped = Path(paths[0]).expanduser()
+        try:
+            if dropped.exists():
+                dropped = dropped.resolve()
+        except OSError:
+            pass
+
+        if dropped.is_file() and dropped.suffix.lower() in IMAGE_EXTENSIONS:
+            self.selected_asset = dropped
+            self.use_found_artwork.set(True)
+            self._set_prompt_visible(False)
+            self._show_image(dropped)
+            self.status_var.set(f"Dropped artwork: {dropped.name}")
+            self._log(f"Drag-and-drop artwork ← {dropped}")
+            # If parent folder looks like a library and source is empty, also set source.
+            if not self.source_var.get().strip() and dropped.parent.is_dir():
+                self._apply_source_path(dropped.parent, scan=False)
+            return event.action if hasattr(event, "action") else None
+
+        target = dropped if dropped.is_dir() else dropped.parent
+        if target.is_dir():
+            self._apply_source_path(target, scan=True)
+            self._log(f"Drag-and-drop library ← {target}")
+        else:
+            self._log(f"Ignored drop (not a folder/image): {dropped}")
+            self.status_var.set("Drop a library folder or image file")
         return event.action if hasattr(event, "action") else None
+
+    def _register_drop_target(self, widget) -> None:
+        if not _HAS_TKDND or widget is None:
+            return
+        try:
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", self._on_drop_path)
+            self._dnd_targets.append(widget)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"DnD register failed on {widget}: {exc}")
 
     def _try_enable_drag_drop(self) -> None:
         """Enable path drops when tkinterdnd2 is available; no-op otherwise."""
+        if not _HAS_TKDND:
+            self._log("Drag-and-drop unavailable (install tkinterdnd2). Browse/paste still work.")
+            return
         try:
-            from tkinterdnd2 import DND_FILES  # type: ignore
+            self._register_drop_target(self)
+            self._register_drop_target(self.source_entry)
+            self._register_drop_target(self.canvas)
+            self._log("Drag-and-drop enabled (tkinterdnd2) on window, source field, and canvas.")
+            self.status_var.set(self.status_var.get() + " · drag & drop ready")
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"Drag-and-drop setup failed: {exc}")
 
-            self.drop_target_register(DND_FILES)
-            self.dnd_bind("<<Drop>>", self._on_drop_path)
-            # Also accept drops on the source entry area if present
-            self._log("Drag-and-drop enabled (tkinterdnd2).")
-        except Exception:
-            # Native Tk without DnD extension — Browse + paste still auto-fill.
-            pass
+    def _save_openai_key(self) -> None:
+        key = self.openai_key_var.get().strip()
+        if not key:
+            messagebox.showwarning(APP_TITLE, "Enter an OpenAI API key first.", parent=self)
+            return
+        try:
+            save_app_config({"openai_api_key": key})
+            self._log(f"Saved OpenAI API key to {APP_CONFIG_PATH} (mode 600)")
+            self.status_var.set("OpenAI API key saved")
+            messagebox.showinfo(APP_TITLE, f"API key saved to:\n{APP_CONFIG_PATH}", parent=self)
+        except OSError as exc:
+            messagebox.showerror(APP_TITLE, f"Could not save key:\n{exc}", parent=self)
+
+    def _preview_placeholder_artwork(self) -> None:
+        vendor = self.vendor_var.get().strip() or "Vendor"
+        library = self.library_var.get().strip() or "Library"
+        prompt = self.ai_prompt_var.get().strip() or f"{library} by {vendor}"
+        img = generate_placeholder_artwork(prompt, vendor, library, size=AI_ARTWORK_SIZE)
+        path = save_master_artwork_cache(img, vendor, library)
+        self.selected_asset = path
+        self.use_found_artwork.set(True)
+        self._show_image(path)
+        self.status_var.set(f"Local placeholder ready: {path.name}")
+        self._log(f"Local placeholder artwork cached → {path}")
+
+    def start_ai_artwork_generation(self) -> None:
+        if self._ai_thread and self._ai_thread.is_alive():
+            messagebox.showinfo(APP_TITLE, "AI artwork generation is already running.", parent=self)
+            return
+        if self._build_thread and self._build_thread.is_alive():
+            messagebox.showinfo(APP_TITLE, "Wait for the current build to finish.", parent=self)
+            return
+
+        vendor = self.vendor_var.get().strip() or "Vendor"
+        library = self.library_var.get().strip() or "Library"
+        prompt = self.ai_prompt_var.get().strip() or f"{library} by {vendor}"
+        api_key = self.openai_key_var.get().strip() or None
+        if api_key:
+            # Keep field/env/config in sync for this session without forcing save.
+            os.environ.setdefault("OPENAI_API_KEY", api_key)
+
+        self.generate_ai_btn.configure(state=DISABLED)
+        self.status_var.set("Generating AI artwork…")
+        self._log(f"AI artwork request · library={library!r} vendor={vendor!r}")
+
+        def worker() -> None:
+            try:
+                img, source = generate_artwork_from_prompt(
+                    prompt,
+                    vendor,
+                    library,
+                    api_key=api_key,
+                    prefer_api=True,
+                    log=self._log,
+                )
+                path = save_master_artwork_cache(img, vendor, library)
+                self._ui_queue.put(("ai_done", path, source, img.size))
+            except Exception:  # noqa: BLE001
+                self._ui_queue.put(("ai_error", traceback.format_exc()))
+
+        self._ai_thread = threading.Thread(target=worker, name="nks-ai-art", daemon=True)
+        self._ai_thread.start()
+
+    def _on_ai_artwork_done(self, path: Path, source: str, size: tuple[int, int]) -> None:
+        self.generate_ai_btn.configure(state=NORMAL)
+        self.selected_asset = path
+        self.use_found_artwork.set(True)
+        self._show_image(path)
+        self.status_var.set(f"AI artwork ready ({source}) · {size[0]}×{size[1]}")
+        self._log(f"AI artwork ready ({source}) → {path}")
+        messagebox.showinfo(
+            APP_TITLE,
+            f"Artwork generated via {source}.\n\n{path}\n\n"
+            "It is selected for Build & Register (modern NKS2 + classic NI sizes).",
+            parent=self,
+        )
+
+    def _on_ai_artwork_error(self, tb: str) -> None:
+        self.generate_ai_btn.configure(state=NORMAL)
+        self._append_log(tb)
+        self.status_var.set("AI artwork generation failed")
+        messagebox.showerror(APP_TITLE, "AI artwork generation failed.\nSee build log.", parent=self)
 
     def scan_source(self) -> None:
         raw = self.source_var.get().strip().strip('"').strip("'")
@@ -2288,6 +2720,7 @@ class NKSDesktopApp(Tk):
         selected = self.selected_asset
         prompt = self.ai_prompt_var.get().strip() or f"{library} by {vendor}"
         ffmpeg = self.ffmpeg_path
+        openai_key = self.openai_key_var.get().strip() or None
 
         def worker() -> None:
             try:
@@ -2302,6 +2735,8 @@ class NKSDesktopApp(Tk):
                     ffmpeg=ffmpeg,
                     log=self._log,
                     progress=self._set_progress,
+                    openai_api_key=openai_key,
+                    prefer_ai_api=True,
                 )
                 self._ui_queue.put(("done", result))
             except Exception:  # noqa: BLE001
@@ -2344,10 +2779,14 @@ class NKSDesktopApp(Tk):
         messagebox.showerror(APP_TITLE, "Unexpected error during build.\nSee build log.", parent=self)
 
     def _on_close(self) -> None:
-        if self._build_thread and self._build_thread.is_alive():
+        busy = (
+            (self._build_thread and self._build_thread.is_alive())
+            or (self._ai_thread and self._ai_thread.is_alive())
+        )
+        if busy:
             if not messagebox.askyesno(
                 APP_TITLE,
-                "A build is still running. Quit anyway?",
+                "A build or AI generation is still running. Quit anyway?",
                 parent=self,
             ):
                 return

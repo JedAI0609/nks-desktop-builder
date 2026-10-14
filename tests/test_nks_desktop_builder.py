@@ -26,13 +26,14 @@ def ffmpeg() -> str:
 
 
 @pytest.fixture(autouse=True)
-def _restore_ni_roots():
-    """Prevent DEFAULT_* path mutations from leaking across tests."""
-    img = m.DEFAULT_IMAGE_ROOT
-    db = m.DEFAULT_DIST_DB_ROOT
-    yield
-    m.DEFAULT_IMAGE_ROOT = img
-    m.DEFAULT_DIST_DB_ROOT = db
+def _sandbox_ni_roots(monkeypatch, tmp_path):
+    """Keep every test away from live NI resources and registration."""
+    import nks_register
+
+    monkeypatch.setattr(nks_register, "install_library_for_kontakt_kk", lambda **kwargs: None)
+    monkeypatch.setattr(m, "ensure_quickload_aliases", lambda *args: None)
+    monkeypatch.setattr(m, "DEFAULT_IMAGE_ROOT", tmp_path / "ni" / "image")
+    monkeypatch.setattr(m, "DEFAULT_DIST_DB_ROOT", tmp_path / "ni" / "db")
 
 
 def _make_wav(ffmpeg: str, path: Path, freq: float = 440.0, dur: float = 3.0) -> None:
@@ -140,7 +141,7 @@ class TestAudioDiscovery:
         hit = m.pick_matching_wav("TotallyUnrelatedPresetName", idx, root)
         assert hit is None
 
-    def test_subfolder_keyword_prefers_timing(self, tmp_path: Path, ffmpeg: str):
+    def test_subfolder_keyword_alone_does_not_assign_timing(self, tmp_path: Path, ffmpeg: str):
         root = tmp_path / "Lib"
         timing = root / "Samples" / "01_2nd Timing"
         oneshots = root / "Samples" / "05_OneShots"
@@ -150,8 +151,7 @@ class TestAudioDiscovery:
         _make_wav(ffmpeg, oneshots / "HitA.wav", 880)
         idx = m.build_source_audio_index(root)
         hit = m.pick_matching_wav("MB03_Clocks_Loops", idx, root)
-        assert hit is not None
-        assert "01_2nd Timing" in hit.parts or "timing" in str(hit).lower()
+        assert hit is None
 
     def test_exact_name_beats_folder_affinity(self, tmp_path: Path, ffmpeg: str):
         """Exact Deep_Pad.wav must beat Samples/Pad/Other.wav folder affinity."""
@@ -339,6 +339,104 @@ class TestArtworkScan:
         assert "artwork" in found[0].matched_keywords
 
 
+class TestDragDropParsing:
+    def test_brace_wrapped_path_with_spaces(self):
+        paths = m.parse_drop_paths("{/Volumes/Instruments/Silence & Other Sounds/Mystery Box 3}")
+        assert paths == ["/Volumes/Instruments/Silence & Other Sounds/Mystery Box 3"]
+
+    def test_multiple_plain_paths(self):
+        paths = m.parse_drop_paths("/tmp/a /tmp/b")
+        assert paths == ["/tmp/a", "/tmp/b"]
+
+    def test_file_url_decoding(self):
+        paths = m.parse_drop_paths("file:///Users/me/My%20Lib")
+        assert paths == ["/Users/me/My Lib"]
+
+    def test_empty_payload(self):
+        assert m.parse_drop_paths("") == []
+        assert m.parse_drop_paths(None) == []
+
+
+class TestAiArtworkHelpers:
+    def test_compose_prompt_includes_library_context(self):
+        text = m.compose_ai_image_prompt("neon fog pads", "Acme", "Neon Pads")
+        assert "neon fog pads" in text
+        assert "Neon Pads" in text
+        assert "Acme" in text
+
+    def test_resolve_key_prefers_explicit(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("OPENAI_API_KEY", "env-key")
+        monkeypatch.setattr(m, "APP_CONFIG_PATH", tmp_path / "cfg.json")
+        (tmp_path / "cfg.json").write_text('{"openai_api_key": "cfg-key"}\n')
+        assert m.resolve_openai_api_key("explicit-key") == "explicit-key"
+        assert m.resolve_openai_api_key(None) == "env-key"
+
+    def test_resolve_key_from_config_when_no_env(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        cfg = tmp_path / "cfg.json"
+        monkeypatch.setattr(m, "APP_CONFIG_PATH", cfg)
+        m.save_app_config({"openai_api_key": "from-config"}, path=cfg)
+        assert m.resolve_openai_api_key() == "from-config"
+
+    def test_placeholder_fallback_without_key(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setattr(m, "load_app_config", lambda path=None: {})
+        img, source = m.generate_artwork_from_prompt(
+            "cinematic brass", "Vendor", "Lib", prefer_api=True
+        )
+        assert source == "placeholder"
+        assert img.size[0] > 0 and img.size[1] > 0
+
+    def test_decode_b64_payload(self):
+        import base64
+        import io
+
+        buf = io.BytesIO()
+        Image.new("RGB", (32, 16), (10, 20, 30)).save(buf, format="PNG")
+        payload = {"data": [{"b64_json": base64.b64encode(buf.getvalue()).decode("ascii")}]}
+        img = m._decode_openai_image_payload(payload)
+        assert img.size == (32, 16)
+
+    def test_pipeline_uses_ai_helper_when_no_found_art(self, tmp_path, ffmpeg, monkeypatch):
+        lib = tmp_path / "Lib"
+        presets = lib / "P"
+        presets.mkdir(parents=True)
+        (presets / "Ghost.nki").write_bytes(b"x")
+
+        calls = {}
+
+        def fake_gen(prompt, vendor, library, **kwargs):
+            calls["prompt"] = prompt
+            img = Image.new("RGB", (64, 32), (1, 2, 3))
+            return img, "placeholder"
+
+        monkeypatch.setattr(m, "generate_artwork_from_prompt", fake_gen)
+        m.DEFAULT_IMAGE_ROOT = tmp_path / "ni" / "image"
+        m.DEFAULT_DIST_DB_ROOT = tmp_path / "ni" / "db"
+
+        result = m.run_pipeline(
+            vendor="V",
+            library="L",
+            source_path=lib,
+            output_path=lib,
+            use_found_artwork=False,
+            selected_asset=None,
+            ai_prompt="deep ocean pads",
+            ffmpeg=ffmpeg,
+            prefer_ai_api=True,
+        )
+        assert result.errors == []
+        assert calls["prompt"] == "deep ocean pads"
+        assert (m.DEFAULT_IMAGE_ROOT / "L" / "NKS2_software_tile.webp").is_file()
+        assert (m.DEFAULT_IMAGE_ROOT / "L" / "NKS2_hardware_banner.webp").is_file()
+
+    def test_save_master_cache(self, tmp_path):
+        img = Image.new("RGBA", (40, 20), (9, 8, 7, 255))
+        path = m.save_master_artwork_cache(img, "Acme", "Pads", dest_dir=tmp_path)
+        assert path.is_file()
+        assert Image.open(path).size == (40, 20)
+
+
 # ---------------------------------------------------------------------------
 # ffmpeg command safety
 # ---------------------------------------------------------------------------
@@ -367,3 +465,289 @@ class TestPreviewBotParity:
         preset = Path("/lib/Bank/Foo.nki")
         out = bot.preview_output_path(preset)
         assert out == Path("/lib/Bank/.previews/Foo.nki.ogg")
+
+
+def _stub_audio(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"not really audio" * 20)
+    return path
+
+
+class TestMatchingRegressions:
+    @pytest.mark.parametrize("exact", ["MB03_Deep_Pad.WaV", "mb03 deep-pad.AiFf", "mb03deeppad.WAVE"])
+    def test_full_name_beats_stripped_and_folder_matches(self, tmp_path, monkeypatch, exact):
+        monkeypatch.setattr(m, "is_safe_audio_file", lambda path, **kwargs: True)
+        expected = _stub_audio(tmp_path / exact)
+        _stub_audio(tmp_path / "Content" / "sAmPlEs" / "Pad" / "Deep_Pad.fLaC")
+        _stub_audio(tmp_path / "Content" / "sAmPlEs" / "Pad" / "Other.ogg")
+        index = m.build_source_audio_index(tmp_path)
+        assert m.pick_matching_wav("MB03_Deep_Pad", index, tmp_path) == expected
+
+    @pytest.mark.parametrize(
+        "preset,sample",
+        [
+            ("MB03_Soft_Piano", "Harsh_Piano.wav"),
+            ("MB03_Deep_Pad", "Pad.wav"),
+            ("Phase2_Soft_Piano", "Harsh_Piano.wav"),
+            ("Soft_Piano", "Piano.wav"),
+            ("Soft_Warm_Piano", "Harsh_Warm_Piano.wav"),
+            ("Air", "Chair.wav"),
+        ],
+    )
+    def test_descriptive_tokens_not_discarded(self, tmp_path, monkeypatch, preset, sample):
+        monkeypatch.setattr(m, "is_safe_audio_file", lambda path, **kwargs: True)
+        _stub_audio(tmp_path / "Samples" / sample)
+        assert m.pick_matching_wav(preset, m.build_source_audio_index(tmp_path), tmp_path) is None
+
+    @pytest.mark.parametrize("folder", ["Loops", "01_2nd Timing", "Clocks_Loops"])
+    def test_no_folder_only_evidence(self, tmp_path, monkeypatch, folder):
+        monkeypatch.setattr(m, "is_safe_audio_file", lambda path, **kwargs: True)
+        _stub_audio(tmp_path / "Nested" / "sAmPlEs" / folder / "Alien.WAVE")
+        assert m.pick_matching_wav(
+            "MB03_Clocks_Loops", m.build_source_audio_index(tmp_path), tmp_path
+        ) is None
+
+    def test_filename_evidence_with_note_suffix(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(m, "is_safe_audio_file", lambda path, **kwargs: True)
+        expected = _stub_audio(tmp_path / "Nested" / "sAmPlEs" / "Pads" / "Soft_Piano_C4.FLAC")
+        assert m.pick_matching_wav(
+            "MB03_Soft_Piano", m.build_source_audio_index(tmp_path), tmp_path
+        ) == expected
+
+    @pytest.mark.parametrize("suffix,codec", [(".AiFf", "pcm_s16be"), (".fLaC", "flac")])
+    def test_real_mixed_case_nested_audio(self, tmp_path, ffmpeg, suffix, codec):
+        source = tmp_path / "source.wav"
+        _make_wav(ffmpeg, source, dur=0.1)
+        expected = tmp_path / "Content" / "sAmPlEs" / "Nested" / f"dEeP pAd{suffix}"
+        expected.parent.mkdir(parents=True)
+        subprocess.check_call([
+            ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(source), "-c:a", codec, str(expected),
+        ])
+        assert m.pick_matching_wav(
+            "Deep_Pad", m.build_source_audio_index(tmp_path), tmp_path
+        ) == expected
+
+    @pytest.mark.parametrize("prefix", ["Phase2", "Soft2", "Dark", "Bright", "Deep"])
+    def test_numbered_descriptions_are_not_library_codes(self, prefix):
+        assert m._strip_library_prefixes(f"{prefix}_Warm_Piano") == [f"{prefix}_Warm_Piano"]
+        assert m._preset_tokens(f"{prefix}_Warm_Piano") == [prefix.lower(), "warm", "piano"]
+
+    @pytest.mark.parametrize("prefix", ["MB03", "mb03", "Mb03", "LIB1", "lib1", "LiB1", "A1", "001"])
+    def test_code_stripping_preserves_entire_description(self, prefix):
+        assert m._strip_library_prefixes(f"{prefix}_Soft_Piano") == [
+            f"{prefix}_Soft_Piano", "Soft_Piano"
+        ]
+        assert m._preset_tokens(f"{prefix}_Soft_Piano") == ["soft", "piano"]
+
+
+class TestPreviewSafety:
+    @pytest.mark.parametrize("kind", ["outside_dir", "inside_dir", "dangling_dir", "file", "dangling_file"])
+    def test_rejects_symlink_destinations(self, tmp_path, monkeypatch, kind):
+        root = tmp_path / "Lib"
+        root.mkdir()
+        (root / "Tone.nki").write_bytes(b"preset")
+        _stub_audio(root / "Tone.wav")
+        outside = tmp_path / "Outside"
+        outside.mkdir()
+        sentinel = outside / "sentinel.ogg"
+        sentinel.write_bytes(b"unchanged")
+        previews = root / ".previews"
+        if kind.endswith("dir"):
+            target = root / "Inside" if kind == "inside_dir" else outside
+            if kind == "inside_dir":
+                target.mkdir()
+            if kind == "dangling_dir":
+                target = outside / "must-not-create"
+            previews.symlink_to(target, target_is_directory=True)
+        else:
+            previews.mkdir()
+            target = sentinel if kind == "file" else outside / "must-not-create.ogg"
+            (previews / "Tone.nki.ogg").symlink_to(target)
+        monkeypatch.setattr(m, "is_safe_audio_file", lambda path, **kwargs: True)
+        calls = []
+        monkeypatch.setattr(m.subprocess, "run", lambda *args, **kwargs: calls.append(args))
+        result = m.mirror_presets_and_previews(root, root, "fake-ffmpeg")
+        assert result[:4] == (1, 0, 1, 0)
+        assert result[4]
+        assert calls == []
+        assert sentinel.read_bytes() == b"unchanged"
+        assert not (outside / "must-not-create").exists()
+        assert not (outside / "must-not-create.ogg").exists()
+
+    @pytest.mark.parametrize("failure", ["exit", "exception", "empty"])
+    def test_failed_conversion_preserves_preview(self, tmp_path, monkeypatch, failure):
+        (tmp_path / "Tone.nki").write_bytes(b"preset")
+        audio = _stub_audio(tmp_path / "Tone.wav")
+        previews = tmp_path / ".previews"
+        previews.mkdir()
+        output = previews / "Tone.nki.ogg"
+        output.write_bytes(b"previous valid preview")
+        monkeypatch.setattr(m, "is_safe_audio_file", lambda path, **kwargs: True)
+
+        def convert(cmd, **kwargs):
+            Path(cmd[-1]).write_bytes(b"" if failure == "empty" else b"partial")
+            if failure == "exception":
+                raise OSError("encoder unavailable")
+            return subprocess.CompletedProcess(cmd, 0 if failure == "empty" else 1, "", "failure")
+
+        monkeypatch.setattr(m.subprocess, "run", convert)
+        result = m.mirror_presets_and_previews(tmp_path, tmp_path, "fake-ffmpeg")
+        assert result[:4] == (1, 0, 1, 0)
+        assert output.read_bytes() == b"previous valid preview"
+        assert audio.read_bytes() == b"not really audio" * 20
+        assert list(previews.iterdir()) == [output]
+
+    def test_retry_then_atomic_success(self, tmp_path, monkeypatch):
+        (tmp_path / "Tone.nki").write_bytes(b"preset")
+        _stub_audio(tmp_path / "Tone.wav")
+        _stub_audio(tmp_path / "Samples" / "Tone.flac")
+        previews = tmp_path / ".previews"
+        previews.mkdir()
+        output = previews / "Tone.nki.ogg"
+        output.write_bytes(b"old")
+        monkeypatch.setattr(m, "is_safe_audio_file", lambda path, **kwargs: True)
+        calls = []
+
+        def convert(cmd, **kwargs):
+            assert Path(cmd[-1]) != output
+            assert output.read_bytes() == b"old"
+            calls.append(cmd)
+            Path(cmd[-1]).write_bytes(b"partial" if len(calls) == 1 else b"new preview")
+            return subprocess.CompletedProcess(cmd, 1 if len(calls) == 1 else 0, "", "")
+
+        monkeypatch.setattr(m.subprocess, "run", convert)
+        assert m.mirror_presets_and_previews(tmp_path, tmp_path, "fake")[1:4] == (1, 0, 0)
+        assert len(calls) == 2
+        assert output.read_bytes() == b"new preview"
+        assert list(previews.iterdir()) == [output]
+
+    @pytest.mark.parametrize("kind", ["directory_symlink", "directory_replaced", "file_symlink", "staging_symlink"])
+    def test_destination_swap_during_conversion_is_rejected(self, tmp_path, monkeypatch, kind):
+        root = tmp_path / "Lib"
+        root.mkdir()
+        (root / "Tone.nki").write_bytes(b"preset")
+        _stub_audio(root / "Tone.wav")
+        previews = root / ".previews"
+        previews.mkdir()
+        output = previews / "Tone.nki.ogg"
+        output.write_bytes(b"old preview")
+        outside = tmp_path / "Outside"
+        outside.mkdir()
+        sentinel = outside / "sentinel.ogg"
+        sentinel.write_bytes(b"do not touch")
+        monkeypatch.setattr(m, "is_safe_audio_file", lambda path, **kwargs: True)
+
+        def convert(cmd, **kwargs):
+            Path(cmd[-1]).write_bytes(b"new preview")
+            if kind.startswith("directory"):
+                previews.rename(root / "Held")
+                if kind == "directory_symlink":
+                    previews.symlink_to(outside, target_is_directory=True)
+                else:
+                    previews.mkdir()
+            elif kind == "file_symlink":
+                output.rename(previews / "old.ogg")
+                output.symlink_to(sentinel)
+            else:
+                stage = next(previews.glob(".preview-*.ogg"))
+                stage.unlink()
+                stage.symlink_to(sentinel)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(m.subprocess, "run", convert)
+        assert m.mirror_presets_and_previews(root, root, "fake")[:4] == (1, 0, 1, 0)
+        assert sentinel.read_bytes() == b"do not touch"
+        preserved = root / "Held" / output.name if kind.startswith("directory") else (
+            previews / "old.ogg" if kind == "file_symlink" else output
+        )
+        assert preserved.read_bytes() == b"old preview"
+        assert list(root.rglob(".preview-*.ogg")) == []
+
+
+class TestAudioValidation:
+    @pytest.mark.parametrize("mode", ["invalid", "no_stream", "empty", "timeout", "oserror"])
+    def test_probe_failures_rejected(self, tmp_path, monkeypatch, mode):
+        audio = _stub_audio(tmp_path / "Tone.wav")
+        monkeypatch.setattr(m.shutil, "which", lambda name: "/fake/ffprobe")
+
+        def probe(cmd, **kwargs):
+            assert kwargs["timeout"] == 8
+            if mode == "timeout":
+                raise subprocess.TimeoutExpired(cmd, 8)
+            if mode == "oserror":
+                raise OSError("probe unavailable")
+            return subprocess.CompletedProcess(
+                cmd, 1 if mode == "invalid" else 0, "wav\n" if mode == "no_stream" else "", ""
+            )
+
+        monkeypatch.setattr(m.subprocess, "run", probe)
+        assert not m.is_safe_audio_file(audio)
+
+    def test_absent_probe_defers_to_encoder(self, tmp_path, monkeypatch):
+        audio = _stub_audio(tmp_path / "Tone.wav")
+        monkeypatch.setattr(m.shutil, "which", lambda name: None)
+        monkeypatch.setattr(m.subprocess, "run", lambda *a, **kw: pytest.fail("no probe should run"))
+        assert m.is_safe_audio_file(audio)
+
+    def test_absent_probe_invalid_audio_cannot_replace_preview(self, tmp_path, monkeypatch, ffmpeg):
+        _stub_audio(tmp_path / "Tone.wav")
+        (tmp_path / "Tone.nki").write_bytes(b"preset")
+        previews = tmp_path / ".previews"
+        previews.mkdir()
+        output = previews / "Tone.nki.ogg"
+        output.write_bytes(b"old preview")
+        monkeypatch.setattr(m.shutil, "which", lambda name: None)
+        assert m.mirror_presets_and_previews(tmp_path, tmp_path, ffmpeg)[:4] == (1, 0, 1, 0)
+        assert output.read_bytes() == b"old preview"
+        assert list(previews.iterdir()) == [output]
+
+    def test_standalone_validation_has_no_global_cache(self, tmp_path, monkeypatch):
+        audio = _stub_audio(tmp_path / "Tone.wav")
+        monkeypatch.setattr(m.shutil, "which", lambda name: "/fake/ffprobe")
+        responses = iter([0, 1])
+        monkeypatch.setattr(m.subprocess, "run", lambda cmd, **kwargs: subprocess.CompletedProcess(
+            cmd, next(responses), "audio\nwav\n", ""
+        ))
+        assert m.is_safe_audio_file(audio)
+        assert not m.is_safe_audio_file(audio)
+
+    def test_changed_file_revalidated_within_cache(self, tmp_path, monkeypatch):
+        audio = _stub_audio(tmp_path / "Tone.wav")
+        monkeypatch.setattr(m.shutil, "which", lambda name: "/fake/ffprobe")
+        responses = iter([0, 1])
+        monkeypatch.setattr(m.subprocess, "run", lambda cmd, **kwargs: subprocess.CompletedProcess(
+            cmd, next(responses), "audio\nwav\n", ""
+        ))
+        cache = {}
+        assert m.is_safe_audio_file(audio, cache=cache)
+        assert m.is_safe_audio_file(audio, cache=cache)
+        audio.write_bytes(b"changed invalid audio" * 50)
+        assert not m.is_safe_audio_file(audio, cache=cache)
+
+    def test_probe_cache_is_shared_within_run_only(self, tmp_path, monkeypatch):
+        _stub_audio(tmp_path / "Tone.wav")
+        for ext in ["nki", "nksn", "nkm"]:
+            (tmp_path / f"Tone.{ext}").write_bytes(b"preset")
+        monkeypatch.setattr(m.shutil, "which", lambda name: "/fake/ffprobe")
+        probes = []
+
+        def run(cmd, **kwargs):
+            if cmd[0] == "/fake/ffprobe":
+                probes.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0 if len(probes) == 1 else 1, "audio\nwav\n", "")
+            Path(cmd[-1]).write_bytes(b"preview")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(m.subprocess, "run", run)
+        first = m.mirror_presets_and_previews(tmp_path, tmp_path, "fake-ffmpeg")
+        assert first[:4] == (3, 3, 0, 0)
+        assert len(probes) == 1
+        second = m.mirror_presets_and_previews(tmp_path, tmp_path, "fake-ffmpeg")
+        assert second[:4] == (3, 0, 0, 3)
+        assert len(probes) == 2
+
+    def test_actual_invalid_audio_rejected(self, tmp_path):
+        if not m.shutil.which("ffprobe"):
+            pytest.skip("ffprobe not available")
+        assert not m.is_safe_audio_file(_stub_audio(tmp_path / "Invalid.wav"))

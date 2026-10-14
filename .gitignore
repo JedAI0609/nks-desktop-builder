@@ -51,3 +51,7 @@ nks_nks2_verify/
 nks_ogg_verify/
 nks_verify_library/
 chatgpt-oz-mcp/
+
+# NKS Desktop Builder local secrets / AI cache
+.nks_desktop_builder.json
+.nks_ai_cache/
