@@ -1607,11 +1607,22 @@ def run_pipeline(
         result.database_path = str(db_path)
         _log(f"Database → {db_path}")
         try:
-            ql = ensure_quickload_aliases(source_path, vendor_s, library_s)
-            _log(f"QuickLoad aliases → {ql}")
+            import nks_register
+            nks_register.install_library_for_kontakt_kk(
+                vendor=vendor,  # original vendor string (keep &)
+                library=library,
+                source_path=source_path,
+                log=_log,
+            )
         except Exception as ql_exc:  # noqa: BLE001
-            result.warnings.append(f"QuickLoad alias setup: {ql_exc}")
-            _log(f"QuickLoad alias warning: {ql_exc}")
+            result.warnings.append(f"Kontakt/KK registration: {ql_exc}")
+            _log(f"Kontakt/KK registration warning: {ql_exc}")
+        # Keep legacy sanitized quickload too
+        try:
+            ql = ensure_quickload_aliases(source_path, vendor_s, library_s)
+            _log(f"Legacy QuickLoad → {ql}")
+        except Exception:
+            pass
         _prog(0.45, "Stage 2/3 · Database complete")
     except Exception as exc:  # noqa: BLE001
         result.errors.append(f"Database injection failed: {exc}")
