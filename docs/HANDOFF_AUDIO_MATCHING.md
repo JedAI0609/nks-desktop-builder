@@ -38,3 +38,16 @@ pytest tests/test_nks_desktop_builder.py -q
 ## Residual / future
 - Wire generative artwork API (README already marks this).
 - Rebuild `.app` with PyInstaller after matching lands if shipping desktop binary.
+
+## Follow-up (2026-10-14 ChatGPT review)
+
+Independent review of `5c3d65b` flagged P1 false positives. Addressed in a subsequent commit:
+
+- Exact name lane always outranks folder affinity
+- Short substring containment blocked (Air↛Chair)
+- Library prefix peel requires digits (Soft_Piano keeps “soft”)
+- Token evidence + true semantic folder hints (clocks→timing); literal folder-only (Loops/Alien) rejected
+- Preview path must resolve under library root (symlink escape blocked)
+- `ffprobe` results cached per file
+
+Regression tests: exact-vs-folder, Air/Chair, Soft/Harsh Piano, Loops/Alien.

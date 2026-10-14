@@ -153,6 +153,43 @@ class TestAudioDiscovery:
         assert hit is not None
         assert "01_2nd Timing" in hit.parts or "timing" in str(hit).lower()
 
+    def test_exact_name_beats_folder_affinity(self, tmp_path: Path, ffmpeg: str):
+        """Exact Deep_Pad.wav must beat Samples/Pad/Other.wav folder affinity."""
+        root = tmp_path / "Lib"
+        samples = root / "Samples"
+        pad = samples / "Pad"
+        pad.mkdir(parents=True)
+        _make_wav(ffmpeg, samples / "Deep_Pad.wav", 440)
+        _make_wav(ffmpeg, pad / "Other.wav", 880)
+        idx = m.build_source_audio_index(root)
+        hit = m.pick_matching_wav("Deep_Pad", idx, root)
+        assert hit is not None
+        assert hit.name == "Deep_Pad.wav"
+
+    def test_rejects_short_substring_false_positive(self, tmp_path: Path, ffmpeg: str):
+        root = tmp_path / "Lib"
+        samples = root / "Samples"
+        samples.mkdir(parents=True)
+        _make_wav(ffmpeg, samples / "Chair.wav", 440)
+        idx = m.build_source_audio_index(root)
+        assert m.pick_matching_wav("Air", idx, root) is None
+
+    def test_rejects_shared_token_only_piano(self, tmp_path: Path, ffmpeg: str):
+        root = tmp_path / "Lib"
+        samples = root / "Samples"
+        samples.mkdir(parents=True)
+        _make_wav(ffmpeg, samples / "Harsh_Piano.wav", 440)
+        idx = m.build_source_audio_index(root)
+        assert m.pick_matching_wav("Soft_Piano", idx, root) is None
+
+    def test_rejects_folder_only_loops_alien(self, tmp_path: Path, ffmpeg: str):
+        root = tmp_path / "Lib"
+        loops = root / "Samples" / "Loops"
+        loops.mkdir(parents=True)
+        _make_wav(ffmpeg, loops / "Alien.wav", 440)
+        idx = m.build_source_audio_index(root)
+        assert m.pick_matching_wav("MB03_Clocks_Loops", idx, root) is None
+
     def test_previews_folder_excluded_from_index(self, tmp_path: Path, ffmpeg: str):
         root = tmp_path / "Lib"
         (root / ".previews").mkdir(parents=True)

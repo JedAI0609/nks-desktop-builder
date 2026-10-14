@@ -675,8 +675,9 @@ def _strip_library_prefixes(stem: str) -> list[str]:
     add(raw)
     peeled = raw
     for _ in range(4):
+        # Require a digit so descriptive words (Soft_, Dark_, Bright_) are kept.
         m = re.match(
-            r"^(?:[A-Za-z]{1,8}\d{0,4}|\d{1,4}[A-Za-z]{0,4})[_\-\.]+(.+)$",
+            r"^(?:[A-Za-z]{1,8}\d{1,4}|\d{1,4}[A-Za-z]{0,4})[_\-\.]+(.+)$",
             peeled,
         )
         if not m:
@@ -686,10 +687,12 @@ def _strip_library_prefixes(stem: str) -> list[str]:
 
     parts = re.split(r"[_\-]+", raw)
     if len(parts) >= 2:
-        add("_".join(parts[1:]))
-        add(" ".join(parts[1:]))
-        if len(parts[-1]) >= 4:
-            add(parts[-1])
+        # Only peel first segment when it looks like a library code (has a digit).
+        if re.search(r"\d", parts[0]):
+            add("_".join(parts[1:]))
+            add(" ".join(parts[1:]))
+            if len(parts[-1]) >= 4:
+                add(parts[-1])
     return variants
 
 
@@ -699,8 +702,11 @@ def _preset_tokens(stem: str) -> list[str]:
     e.g. MB03_Clocks_Loops.nki → ['clocks', 'loops'] (MB03 dropped as code prefix).
     """
     variants = _strip_library_prefixes(stem)
-    # Prefer the most stripped non-empty variant for tokenization
-    base = variants[-1] if variants else (stem or "")
+    # Tokenize the original stem (and lightly stripped code prefixes), not the
+    # most aggressively shortened tail — keeps Soft_Piano → soft+piano.
+    base = variants[0] if variants else (stem or "")
+    if len(variants) > 1 and re.search(r"\d", variants[0].split("_")[0] if variants[0] else ""):
+        base = variants[1]
     raw_parts = re.split(r"[^A-Za-z0-9]+", base)
     tokens: list[str] = []
     seen: set[str] = set()
@@ -727,16 +733,31 @@ def _preset_tokens(stem: str) -> list[str]:
 
 
 def _sequence_similarity(a: str, b: str) -> float:
-    """Simple 0..1 similarity for ranking name pairs."""
+    """Simple 0..1 similarity for ranking name pairs.
+
+    Short substring hits (e.g. "air" inside "chair") are rejected so weak
+    containment cannot masquerade as a real name match.
+    """
     if not a or not b:
         return 0.0
     if a == b:
         return 1.0
     if a in b or b in a:
         shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+        # Require meaningful containment length to avoid Air→Chair style hits.
+        if len(shorter) < 4:
+            return 0.0
+        # Contained token must be a sizable fraction of the longer name.
+        if len(shorter) / max(len(longer), 1) < 0.5:
+            return 0.15  # weak signal only; relevance gate will usually drop it
         return 0.72 + 0.28 * (len(shorter) / max(len(longer), 1))
     ta = set(re.findall(r"[a-z]+|\d+", a))
     tb = set(re.findall(r"[a-z]+|\d+", b))
+    if not ta or not tb:
+        return 0.0
+    # Ignore 1-2 char tokens in Jaccard so "a"/"in" noise does not couple names.
+    ta = {t for t in ta if len(t) >= 3}
+    tb = {t for t in tb if len(t) >= 3}
     if not ta or not tb:
         return 0.0
     inter = len(ta & tb)
@@ -815,11 +836,60 @@ def _filename_token_score(tokens: list[str], path: Path) -> float:
             continue
         if tn == name_norm:
             score += 1.2
-        elif tn in name_norm or tok in name_low:
+        elif len(tn) >= 4 and (tn in name_norm or tok in name_low):
+            # Whole-token containment only for longer tokens (blocks air⊂chair).
             score += 0.9
         else:
             score += 0.5 * _sequence_similarity(tn, name_norm)
     return score / max(len(tokens), 1)
+
+
+def _token_evidence_ratio(tokens: list[str], path: Path, source_root: Path) -> float:
+    """Fraction of preset tokens evidenced in filename or Samples folder/semantics."""
+    return _token_evidence_breakdown(tokens, path, source_root)[0]
+
+
+def _token_evidence_breakdown(
+    tokens: list[str], path: Path, source_root: Path
+) -> tuple[float, float, bool]:
+    """
+    Returns (evidence_ratio, filename_ratio, has_semantic_folder_hit).
+
+    has_semantic_folder_hit is True only when a token maps via _FOLDER_SEMANTIC_HINTS
+    (e.g. clocks→timing), not merely because the folder is literally named "loops".
+    """
+    if not tokens:
+        return 0.0, 0.0, False
+    name_norm = _normalize_audio_key(path.stem)
+    labels = _samples_subfolder_labels(path, source_root)
+    label_blob = " ".join(labels)
+    hit = 0
+    file_hit = 0
+    semantic_folder = False
+    for tok in tokens:
+        tn = _normalize_audio_key(tok)
+        ok = False
+        if tn and len(tn) >= 3 and (
+            tn == name_norm
+            or (len(tn) >= 4 and tn in name_norm and len(tn) / max(len(name_norm), 1) >= 0.5)
+        ):
+            ok = True
+            file_hit += 1
+        elif tok in label_blob or any(tok in lab or lab in tok for lab in labels if len(lab) >= 3):
+            ok = True
+        for hint in _FOLDER_SEMANTIC_HINTS.get(tok, ()):
+            if hint in label_blob or any(hint in lab for lab in labels):
+                ok = True
+                # Only count as *semantic* when the hint is a different concept
+                # than the token itself (clocks→timing). loops→"loop" inside
+                # folder "loops" is literal, not semantic.
+                if hint != tok and hint not in tok and tok not in hint:
+                    semantic_folder = True
+                break
+        if ok:
+            hit += 1
+    n = max(len(tokens), 1)
+    return hit / n, file_hit / n, semantic_folder
 
 
 def _list_all_audio_paths(index: dict[str, list[Path]]) -> list[Path]:
@@ -881,6 +951,9 @@ def _is_metadata_or_junk_audio(path: Path) -> bool:
     return False
 
 
+_SAFE_AUDIO_CACHE: dict[tuple[str, int, int], bool] = {}
+
+
 def is_safe_audio_file(path: Path) -> bool:
     """
     Pre-flight check before ffmpeg:
@@ -888,7 +961,26 @@ def is_safe_audio_file(path: Path) -> bool:
       - not metadata junk
       - size > 0 bytes
       - optional container sniff via ffprobe when available
+
+    Results are cached per (resolved path, mtime_ns, size) so large libraries
+    do not re-ffprobe the same file once per preset.
     """
+    try:
+        st = path.stat()
+        cache_key = (str(path.resolve()), int(getattr(st, "st_mtime_ns", st.st_mtime * 1e9)), int(st.st_size))
+    except OSError:
+        return False
+
+    cached = _SAFE_AUDIO_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    ok = _is_safe_audio_file_uncached(path)
+    _SAFE_AUDIO_CACHE[cache_key] = ok
+    return ok
+
+
+def _is_safe_audio_file_uncached(path: Path) -> bool:
     try:
         if not path.is_file():
             return False
@@ -978,12 +1070,10 @@ def rank_matching_wavs(
     Strict priority audio mapping (NO random first-available fallback):
 
       1. Purge metadata (already done at index time + re-checked here)
-      2. Exact / prefix-stripped 1:1 name match
-      3. Keyword tokens from preset (MB03_Clocks_Loops → clocks, loops)
-      4. Prefer Samples/ subfolders whose names align with those tokens
-         (e.g. timing/clocks/loops folders over unrelated oneshots)
-      5. Only return candidates with real token/name/folder relevance
-         OR verified exact stem match — never a random unrelated .wav
+      2. Exact / prefix-stripped 1:1 name match (always wins over folder hints)
+      3. Strong name similarity + keyword tokens
+      4. Samples/ subfolder alignment only as a *secondary* signal
+      5. Drop weak / folder-only / short-substring false positives
 
     Each candidate is size/legitimacy-checked via is_safe_audio_file().
     """
@@ -1004,11 +1094,12 @@ def rank_matching_wavs(
     variants = _strip_library_prefixes(stem)
     norms = [_normalize_audio_key(v) for v in variants if _normalize_audio_key(v)]
 
-    scored: list[tuple[float, float, float, int, int, Path]] = []
-    # tuple: (-total, -folder, -file, dir_pri, ext_pri, path)
+    # tuple: (tier, -total, -name, -file, -folder, dir_pri, ext_pri, path)
+    # tier 0 = exact/near-exact name; tier 1 = strong relevance; never folder-only.
+    scored: list[tuple[int, float, float, float, float, int, int, Path]] = []
     seen: set[str] = set()
 
-    def consider(path: Path, base_sim: float, require_relevance: bool) -> None:
+    def consider(path: Path, base_sim: float, *, exact_lane: bool) -> None:
         if _is_metadata_or_junk_audio(path) or not is_safe_audio_file(path):
             return
         key = str(path)
@@ -1016,18 +1107,43 @@ def rank_matching_wavs(
             return
         folder_sc = _folder_token_score(tokens, path, root)
         file_sc = _filename_token_score(tokens, path)
-        # Exact stem bonus already in base_sim
-        total = base_sim + 1.35 * folder_sc + 1.1 * file_sc
-        if require_relevance and base_sim < 0.95:
-            # Must have keyword or folder relationship — no random picks
-            if folder_sc < 0.25 and file_sc < 0.35 and base_sim < 0.5:
+
+        if exact_lane or base_sim >= 0.95:
+            # Exact/near-exact names dominate regardless of folder affinity.
+            tier = 0
+            total = 10.0 + base_sim + 0.15 * file_sc + 0.05 * folder_sc
+        else:
+            # Relevance gate: block weak substring and single-shared-token hits.
+            # Examples rejected: Air→Chair, Soft_Piano→Harsh_Piano (only "piano"),
+            # MB03_Clocks_Loops→Loops/Alien.wav (folder token only, alien name).
+            evidence, file_ratio, semantic_hit = _token_evidence_breakdown(tokens, path, root)
+            strong_name = base_sim >= 0.72
+            # Semantic folder (clocks→timing) may pair without filename overlap.
+            # Literal folder token only (loops→Loops/Alien.wav) is not enough.
+            semantic_folder = semantic_hit and folder_sc >= 0.4 and evidence >= 0.5
+            majority = evidence >= 0.67 and file_ratio >= 0.34
+            if not (strong_name or majority or semantic_folder):
                 return
+            # Soft_Piano vs Harsh_Piano: shared category token, weak whole-name sim.
+            if (
+                len(tokens) <= 2
+                and base_sim < 0.55
+                and file_sc < 0.95
+                and evidence < 1.0
+                and not semantic_folder
+            ):
+                return
+            tier = 1
+            total = base_sim + 0.85 * file_sc + 0.35 * folder_sc + 0.4 * evidence
+
         seen.add(key)
         scored.append(
             (
+                tier,
                 -total,
-                -folder_sc,
+                -base_sim,
                 -file_sc,
+                -folder_sc,
                 _audio_dir_priority(path, root),
                 ext_rank.get(path.suffix.lower(), 999),
                 path,
@@ -1037,13 +1153,13 @@ def rank_matching_wavs(
     # --- Priority 1: exact / stripped exact names ---
     for v in variants:
         for p in index.get(v.lower(), []):
-            consider(p, 1.0, require_relevance=False)
+            consider(p, 1.0, exact_lane=True)
         nv = _normalize_audio_key(v)
         if nv:
             for p in index.get(f"norm:{nv}", []):
-                consider(p, 0.98, require_relevance=False)
+                consider(p, 0.98, exact_lane=True)
 
-    # --- Priority 2–3: token + Samples subfolder cross-reference ---
+    # --- Priority 2–3: name similarity + token relevance ---
     for p in search_pool:
         pnorm = _normalize_audio_key(p.stem)
         best = 0.0
@@ -1052,14 +1168,16 @@ def rank_matching_wavs(
                 continue
             if nv == pnorm:
                 best = max(best, 1.0)
-            elif nv in pnorm or pnorm in nv:
-                best = max(best, 0.75)
+            elif len(nv) >= 4 and len(pnorm) >= 4 and (nv in pnorm or pnorm in nv):
+                shorter, longer = (nv, pnorm) if len(nv) <= len(pnorm) else (pnorm, nv)
+                ratio = len(shorter) / max(len(longer), 1)
+                best = max(best, 0.75 if ratio >= 0.5 else 0.2)
             else:
                 best = max(best, _sequence_similarity(nv, pnorm))
-        consider(p, best, require_relevance=True)
+        consider(p, best, exact_lane=False)
 
     scored.sort()
-    return [t[5] for t in scored]
+    return [t[7] for t in scored]
 
 
 def pick_matching_wav(
@@ -1164,6 +1282,22 @@ def mirror_presets_and_previews(
 
         previews_dir = ensure_dir(dest_preset.parent / ".previews")
         out_ogg = previews_dir / f"{dest_preset.name}.ogg"
+
+        # Containment: refuse to write if .previews resolves outside the library
+        # (e.g. a symlinked .previews directory pointing elsewhere).
+        try:
+            previews_resolved = previews_dir.resolve()
+            out_resolved = out_ogg.resolve()
+            previews_resolved.relative_to(lib_root)
+            out_resolved.relative_to(lib_root)
+        except (OSError, ValueError):
+            fail += 1
+            errors.append(
+                f"refusing preview path outside library for {preset.name}: {previews_dir}"
+            )
+            if log:
+                log(f"SKIP {preset.name}: .previews path escapes library root")
+            continue
 
         candidates = rank_matching_wavs(preset.stem, audio_index, source_root=lib_root)
         if not candidates:
