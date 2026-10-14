@@ -40,3 +40,6 @@ lib-kompanion/
 lib-kompanion-build-verify/
 lib-kompanion-origin.git/
 plugin-inventory/
+
+# PyInstaller onedir leftover
+NKS Desktop Builder/
