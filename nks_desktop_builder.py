@@ -553,38 +553,156 @@ def iter_preset_files(root: Path) -> Iterable[Path]:
             yield path
 
 
+# Folder names that typically hold raw samples — preferred during match ranking.
+_PREFERRED_AUDIO_DIR_NAMES = (
+    "samples",
+    "sample",
+    "instruments data",
+    "instrument data",
+    "instruments",
+    "instrument",
+    "audio",
+    "wavs",
+    "waves",
+    "multisamples",
+    "resources",
+    "data",
+)
+
+
+def _normalize_audio_key(name: str) -> str:
+    """Normalize preset/audio basenames for fuzzy equality (case, separators)."""
+    s = (name or "").strip().lower()
+    s = s.replace("&", " and ")
+    s = re.sub(r"[\s_\-./\\]+", "", s)
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s
+
+
+def _audio_dir_priority(path: Path, source_root: Path) -> int:
+    """
+    Lower is better. Prefer files nested under Samples / Instruments Data / etc.
+    """
+    try:
+        rel_parts = [p.lower() for p in path.relative_to(source_root).parts[:-1]]
+    except ValueError:
+        rel_parts = [p.lower() for p in path.parts[:-1]]
+    best = 50
+    for i, preferred in enumerate(_PREFERRED_AUDIO_DIR_NAMES):
+        if preferred in rel_parts:
+            best = min(best, i)
+    # Slight preference for deeper sample trees over root-level orphans
+    depth_bonus = 0 if best < 50 else min(len(rel_parts), 9)
+    return best * 10 + (0 if best < 50 else 10 - depth_bonus)
+
+
 def build_source_audio_index(source_root: Path) -> dict[str, list[Path]]:
+    """
+    Deep recursive index of all audio under source_root (any nested depth),
+    including Samples / Instruments Data / Instruments / …
+
+    Keys are lowercased stems; also stores a parallel normalized map via
+    the special key namespace used by pick_matching_wav.
+    """
     index: dict[str, list[Path]] = {}
     for path in source_root.rglob("*"):
         if not path.is_file():
             continue
         if path.suffix.lower() not in SOURCE_AUDIO_EXTENSIONS:
             continue
+        # Never treat generated previews as source audio
         if any(part == ".previews" for part in path.parts):
             continue
-        index.setdefault(path.stem.lower(), []).append(path)
+        # Read-only discovery — do not open/alter the file here
+        stem_key = path.stem.lower()
+        index.setdefault(stem_key, []).append(path)
+        norm = _normalize_audio_key(path.stem)
+        if norm and norm != stem_key:
+            index.setdefault(f"norm:{norm}", []).append(path)
     return index
 
 
-def pick_matching_wav(stem: str, index: dict[str, list[Path]]) -> Path | None:
-    candidates = index.get(stem.lower(), [])
+def pick_matching_wav(
+    stem: str,
+    index: dict[str, list[Path]],
+    source_root: Path | None = None,
+) -> Path | None:
+    """
+    Find best matching source audio for a preset stem.
+
+    Match order:
+      1. Exact stem (case-insensitive), e.g. MB03_Clocks_Loops.nki → MB03_Clocks_Loops.wav
+      2. Normalized stem (ignore spaces/underscores/hyphens)
+      3. Unique normalized containment (preset stem contained in audio name or vice versa)
+
+    Among candidates, prefer files under Samples / Instruments Data / … then .wav.
+    Original audio files are never modified — path is read-only for ffmpeg -i.
+    """
+    stem_l = (stem or "").lower()
+    norm = _normalize_audio_key(stem)
+    candidates: list[Path] = []
+
+    # 1) Exact stem
+    candidates.extend(index.get(stem_l, []))
+
+    # 2) Normalized exact
+    if norm:
+        for p in index.get(f"norm:{norm}", []):
+            if p not in candidates:
+                candidates.append(p)
+
+    # 3) Fuzzy containment across full recursive inventory (only if still empty)
+    if not candidates and norm and len(norm) >= 4:
+        fuzzy: list[Path] = []
+        seen: set[str] = set()
+        for key, paths in index.items():
+            if key.startswith("norm:"):
+                other = key[5:]
+            else:
+                other = _normalize_audio_key(key)
+            if not other:
+                continue
+            if norm == other or norm in other or other in norm:
+                for p in paths:
+                    pk = str(p)
+                    if pk not in seen:
+                        seen.add(pk)
+                        fuzzy.append(p)
+        # Only accept fuzzy if unambiguous-ish (prefer unique; else still rank)
+        candidates.extend(fuzzy)
+
     if not candidates:
         return None
-    rank = {ext: i for i, ext in enumerate(SOURCE_AUDIO_EXTENSIONS)}
-    return sorted(candidates, key=lambda p: (rank.get(p.suffix.lower(), 999), str(p).lower()))[0]
+
+    root = source_root or Path("/")
+    ext_rank = {ext: i for i, ext in enumerate(SOURCE_AUDIO_EXTENSIONS)}
+
+    def sort_key(p: Path) -> tuple[int, int, int, str]:
+        return (
+            _audio_dir_priority(p, root),
+            ext_rank.get(p.suffix.lower(), 999),
+            len(str(p)),  # shorter paths slightly preferred when tied
+            str(p).lower(),
+        )
+
+    return sorted(candidates, key=sort_key)[0]
 
 
 def ffmpeg_preview_cmd(ffmpeg: str, src: Path, dst: Path) -> list[str]:
+    """
+    Read-only ffmpeg invocation: -i opens source audio without writing it back.
+    Output is exclusively the new .ogg under .previews/.
+    """
     # Homebrew ffmpeg here ships native `vorbis` (not libvorbis); needs -strict -2
     # and stereo (-ac 2). Falls back cleanly for NKS-style .ogg previews.
     return [
         ffmpeg,
-        "-y",
+        "-y",  # overwrite only the destination .ogg if re-run
         "-hide_banner",
         "-loglevel",
         "error",
         "-i",
-        str(src),
+        str(src),  # INPUT only — never the write target
         "-t",
         f"{PREVIEW_DURATION_SEC:.1f}",
         "-ac",
@@ -596,7 +714,7 @@ def ffmpeg_preview_cmd(ffmpeg: str, src: Path, dst: Path) -> list[str]:
         "-q:a",
         "5",
         "-vn",
-        str(dst),
+        str(dst),  # OUTPUT only — .previews/*.ogg
     ]
 
 
@@ -620,57 +738,76 @@ def mirror_presets_and_previews(
     progress: Callable[[float, str], None] | None = None,
 ) -> tuple[int, int, int, int, list[str]]:
     """
-    Deploy .previews OGG matrices beside presets.
+    NON-DESTRUCTIVE preview deploy.
 
-    When target_root is the same directory as source_root (in-place / auto-target),
-    presets are left where they are and only hidden .previews folders are written
-    next to them. Otherwise presets are copied into target_root first.
+    - Never deletes, moves, renames, or overwrites original .nki / .nkm / .nksn /
+      .nksf / .wav (or other sample) files.
+    - Never copies presets out of place when operating on the library root.
+    - Only *creates/updates* files under hidden `.previews/` directories:
+        [PresetDir]/.previews/[PresetName].[ext].ogg
+    - Source audio is opened read-only by ffmpeg (`-i`); only the .ogg path is written.
+
+    Audio discovery is deep-recursive across the whole tree, with preference for
+    nested folders such as Samples and Instruments Data.
     """
-    ensure_dir(target_root)
     try:
-        in_place = source_root.resolve() == target_root.resolve()
+        lib_root = source_root.expanduser().resolve()
     except OSError:
-        in_place = str(source_root) == str(target_root)
+        lib_root = source_root.expanduser()
 
-    audio_index = build_source_audio_index(source_root)
-    presets = list(iter_preset_files(source_root))
+    # target_root is accepted for API compat; previews always sit beside each preset.
+    _ = target_root
+
+    if log:
+        log("Non-destructive mode: originals (.nki/.nkm/.wav/…) are never modified or moved")
+        log(f"Deep audio scan under {lib_root} (includes Samples / Instruments Data / …)")
+
+    audio_index = build_source_audio_index(lib_root)
+    audio_file_count = sum(len(v) for k, v in audio_index.items() if not k.startswith("norm:"))
+    presets = list(iter_preset_files(lib_root))
     total = max(len(presets), 1)
-    mirrored = ok = fail = missing = 0
+    processed = ok = fail = missing = 0
     errors: list[str] = []
 
     if log:
-        mode = "in-place (original library folder)" if in_place else f"copy → {target_root}"
-        log(f"Preset/preview deploy mode: {mode}")
+        log(f"Indexed {audio_file_count} nested audio file(s); {len(presets)} preset(s)")
 
     for i, preset in enumerate(presets):
-        rel = preset.relative_to(source_root)
-        if in_place:
-            dest_preset = preset
-            mirrored += 1
-        else:
-            dest_preset = target_root / rel
-            ensure_dir(dest_preset.parent)
-            try:
-                shutil.copy2(preset, dest_preset)
-                mirrored += 1
-            except OSError as exc:
-                errors.append(f"copy failed {preset}: {exc}")
-                if progress:
-                    progress((i + 1) / total, f"Copy failed: {rel}")
-                continue
+        # Preset path is reference-only — never written, moved, or replaced.
+        dest_preset = preset
+        processed += 1
+        rel = preset.relative_to(lib_root)
 
         previews_dir = ensure_dir(dest_preset.parent / ".previews")
         out_ogg = previews_dir / f"{dest_preset.name}.ogg"
-        wav = pick_matching_wav(preset.stem, audio_index)
+
+        wav = pick_matching_wav(preset.stem, audio_index, source_root=lib_root)
         if wav is None:
             missing += 1
             if log:
-                log(f"MISS audio for {preset.name}")
+                log(f"MISS audio for {preset.name} (searched recursively under library)")
             if progress:
                 progress((i + 1) / total, f"No audio: {preset.name}")
             continue
 
+        # Safety: never allow ffmpeg output path to equal a source audio/preset path
         try:
+            if out_ogg.resolve() == wav.resolve() or out_ogg.resolve() == preset.resolve():
+                fail += 1
+                errors.append(f"refusing to overwrite source path for {preset.name}")
+                continue
+        except OSError:
+            pass
+
+        if log:
+            try:
+                wav_rel = wav.relative_to(lib_root)
+            except ValueError:
+                wav_rel = wav
+            log(f"MATCH {preset.name} ← {wav_rel}")
+
+        try:
+            # ffmpeg reads `wav` and writes only `out_ogg` under .previews/
             proc = subprocess.run(
                 ffmpeg_preview_cmd(ffmpeg, wav, out_ogg),
                 check=False,
@@ -680,7 +817,7 @@ def mirror_presets_and_previews(
             if proc.returncode == 0 and out_ogg.is_file():
                 ok += 1
                 if log:
-                    log(f"OK  {out_ogg}")
+                    log(f"OK  {out_ogg}  (source untouched: {wav.name})")
             else:
                 fail += 1
                 err = (proc.stderr or "").strip()[:300]
@@ -692,7 +829,7 @@ def mirror_presets_and_previews(
         if progress:
             progress((i + 1) / total, f"Preview {i + 1}/{len(presets)}: {rel}")
 
-    return mirrored, ok, fail, missing, errors
+    return processed, ok, fail, missing, errors
 
 
 def run_pipeline(
