@@ -69,17 +69,38 @@ SOURCE_AUDIO_EXTENSIONS = (".wav", ".wave", ".aif", ".aiff", ".flac", ".mp3", ".
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}
 ARTWORK_KEYWORDS = ("wallpaper", "banner", "folder", "artwork", "icon")
 
-# Complete NKS2 / Kontakt 7–8 sidebar visual array (exact pixel sizes).
+# Complete NKS2 / Kontakt 7–8 + Komplete Kontrol visual array.
+# Sizes mirror factory NI libraries under /Users/Shared/NI Resources/image/*.
+# PNG kept for legacy BND/MST; WEBP used for modern NKS2 tiles/banners (KK + K8).
 NI_IMAGE_SPECS: dict[str, tuple[int, int]] = {
+    # Legacy / browser (Kontakt classic list + banners)
     "MST_artwork.png": (134, 66),
-    "MST_logo.png": (134, 66),
+    "MST_logo.png": (240, 196),
+    "MST_plugin.png": (162, 100),
     "BND_artwork.png": (272, 90),
     "BND_logo.png": (272, 90),
-    "NKS2_software_tile.png": (420, 136),
+    "VB_artwork.png": (96, 47),
+    "VB_logo.png": (227, 47),
+    "OSO_logo.png": (417, 65),
+    # Modern NKS2 / KK (also written as .webp — see format_ni_images)
+    "NKS2_software_tile.png": (420, 316),
     "NKS2_hardware_banner.png": (1280, 212),
+    "NKS2_hardware_banner_1280x152.png": (1280, 152),
 }
 # Filenames that use contain/logo treatment instead of cover-crop.
-NI_LOGO_FILES = frozenset({"MST_logo.png", "BND_logo.png"})
+NI_LOGO_FILES = frozenset({
+    "MST_logo.png",
+    "BND_logo.png",
+    "VB_logo.png",
+    "OSO_logo.png",
+    "MST_plugin.png",
+})
+# NKS2 assets that factory ships as WEBP (Kontakt 8 / KK prefer these).
+NI_WEBP_ALIASES: dict[str, str] = {
+    "NKS2_software_tile.png": "NKS2_software_tile.webp",
+    "NKS2_hardware_banner.png": "NKS2_hardware_banner.webp",
+    "NKS2_hardware_banner_1280x152.png": "NKS2_hardware_banner_1280x152.webp",
+}
 
 PREVIEW_DURATION_SEC = 2.0
 FFMPEG_CANDIDATES = (
@@ -503,11 +524,10 @@ def fit_logo(img: Image.Image, size: tuple[int, int]) -> Image.Image:
 
 def format_ni_images(source_image: Image.Image, dest_dir: Path) -> dict[str, Path]:
     """
-    Write the full modern NKS2 image set into dest_dir:
-      MST_artwork / MST_logo (134×66),
-      BND_artwork / BND_logo (272×90),
-      NKS2_software_tile (420×136),
-      NKS2_hardware_banner (1280×212).
+    Write the full Kontakt + Komplete Kontrol image set into dest_dir.
+
+    Includes legacy MST/BND/VB/OSO PNGs and modern NKS2 tiles/banners as both
+    PNG and WEBP (factory NI libs ship WEBP for NKS2_*).
     """
     ensure_dir(dest_dir)
     written: dict[str, Path] = {}
@@ -517,9 +537,50 @@ def format_ni_images(source_image: Image.Image, dest_dir: Path) -> dict[str, Pat
         else:
             out = fit_cover(source_image, dims)
         target = dest_dir / filename
-        out.save(target, format="PNG", optimize=True)
+        out_rgba = out.convert("RGBA") if out.mode != "RGBA" else out
+        out_rgba.save(target, format="PNG", optimize=True)
         written[filename] = target
+        webp_name = NI_WEBP_ALIASES.get(filename)
+        if webp_name:
+            webp_path = dest_dir / webp_name
+            # WEBP does not need alpha for tiles; RGB keeps files smaller.
+            out_rgba.convert("RGB").save(webp_path, format="WEBP", quality=90, method=6)
+            written[webp_name] = webp_path
     return written
+
+
+def write_image_resource_meta(library: str, dest_dir: Path, version: str = "2.6140.0.0") -> Path:
+    """Write NI-style <library>.meta next to image assets (required for resource scan)."""
+    ensure_dir(dest_dir)
+    meta_path = dest_dir / f"{library}.meta"
+    xml = "\n".join([
+        '<?xml version="1.0" encoding="UTF-8" standalone="no" ?>',
+        f'<resource version="{version}">',
+        "",
+        f"  <name>{library}</name>",
+        "",
+        "  <type>image</type>",
+        "",
+        "</resource>",
+        "",
+    ])
+    meta_path.write_text(xml, encoding="utf-8")
+    return meta_path
+
+
+def ni_image_install_dirs(vendor: str, library: str) -> list[Path]:
+    """
+    Paths where Kontakt/KK look for library artwork.
+
+    Primary (factory style): image/<Library Name>/
+    Compatibility copy:     image/<Vendor>/<Library>/
+    """
+    lib = sanitize_segment(library, "Library")
+    vend = sanitize_segment(vendor, "Vendor")
+    return [
+        DEFAULT_IMAGE_ROOT / lib,
+        DEFAULT_IMAGE_ROOT / vend / lib,
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -528,7 +589,7 @@ def format_ni_images(source_image: Image.Image, dest_dir: Path) -> dict[str, Pat
 
 
 def write_dist_database(vendor: str, library: str, dest_root: Path = DEFAULT_DIST_DB_ROOT) -> Path:
-    out_dir = ensure_dir(dest_root / vendor / library)
+    """Write dist_database entries for vendor/library and flat library paths."""
     short = slugify(library)
     payload = {
         "schema_version": 1,
@@ -548,23 +609,97 @@ def write_dist_database(vendor: str, library: str, dest_root: Path = DEFAULT_DIS
             "nks": True,
         },
         "paths": {
-            "image": f"image/{vendor}/{library}",
-            "content": library,
+            "image": f"image/{library}",
+            "image_vendor": f"image/{vendor}/{library}",
+            "content": str(Path("Silence & Other Sounds") / library)
+            if "silence" in vendor.lower()
+            else library,
         },
         "meta": {"app_dir": str(APP_DIR)},
     }
-    primary = out_dir / "database.json"
-    legacy = out_dir / f"{short}.json"
-    text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
-    primary.write_text(text, encoding="utf-8")
-    legacy.write_text(text, encoding="utf-8")
+    body = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    out_dirs = [
+        ensure_dir(dest_root / vendor / library),
+        ensure_dir(dest_root / library),
+    ]
+    primary = out_dirs[0] / "database.json"
+    db_meta = "\n".join([
+        '<?xml version="1.0" encoding="UTF-8" standalone="no" ?>',
+        '<resource version="2.6140.0.0">',
+        "",
+        f"  <name>{library}</name>",
+        "",
+        "  <type>database</type>",
+        "",
+        "</resource>",
+        "",
+    ])
+    for out_dir in out_dirs:
+        (out_dir / "database.json").write_text(body, encoding="utf-8")
+        (out_dir / f"{short}.json").write_text(body, encoding="utf-8")
+        (out_dir / f"{library}.meta").write_text(db_meta, encoding="utf-8")
     return primary
+
+
+def ensure_quickload_aliases(source_library: Path, vendor: str, library: str) -> Path:
+    """
+    Create/refresh Kontakt QuickLoad aliases so the library appears under
+    Quick Load → Instr → <Vendor> → <Library>.
+    """
+    ql_root = (
+        Path.home()
+        / "Library/Application Support/Native Instruments/Kontakt 8/QuickLoad/Instr"
+        / sanitize_segment(vendor, "Vendor")
+        / sanitize_segment(library, "Library")
+    )
+    ensure_dir(ql_root)
+    # Link Instruments (or KONTAKT Instruments) presets via macOS aliases using ln -s
+    # Symlinks are enough for Finder/Kontakt QuickLoad in practice.
+    candidates = [
+        source_library / "Instruments",
+        source_library / "Kontakt Instruments",
+        source_library / "KONTAKT Instruments",
+        source_library / "KONTAKT_Instruments",
+    ]
+    src_instr = next((p for p in candidates if p.is_dir()), None)
+    if src_instr is None:
+        return ql_root
+    dest_instr = ql_root / src_instr.name
+    if dest_instr.is_symlink() or dest_instr.exists():
+        if dest_instr.is_symlink():
+            dest_instr.unlink()
+        elif dest_instr.is_dir():
+            # leave existing managed folder; refresh file symlinks inside
+            pass
+    if not dest_instr.exists():
+        try:
+            dest_instr.symlink_to(src_instr, target_is_directory=True)
+        except OSError:
+            ensure_dir(dest_instr)
+            for preset in src_instr.glob("*.nki"):
+                if preset.name.startswith("._"):
+                    continue
+                link = dest_instr / preset.name
+                if link.exists() or link.is_symlink():
+                    try:
+                        link.unlink()
+                    except OSError:
+                        pass
+                try:
+                    link.symlink_to(preset)
+                except OSError:
+                    pass
+    return ql_root
 
 
 def iter_preset_files(root: Path) -> Iterable[Path]:
     for path in root.rglob("*"):
         if path.is_file() and path.suffix.lower() in PRESET_EXTENSIONS:
+            if path.name.startswith("._") or path.name.startswith("."):
+                continue  # skip AppleDouble / hidden junk
             if any(part == ".previews" for part in path.parts):
+                continue
+            if any(part.startswith("._") for part in path.parts):
                 continue
             yield path
 
@@ -1121,7 +1256,9 @@ def rank_matching_wavs(
             # Semantic folder (clocks→timing) may pair without filename overlap.
             # Literal folder token only (loops→Loops/Alien.wav) is not enough.
             semantic_folder = semantic_hit and folder_sc >= 0.4 and evidence >= 0.5
-            majority = evidence >= 0.67 and file_ratio >= 0.34
+            # Majority token evidence via filename AND/OR Samples folder labels
+            # (PainPiano_STABS_CLUSTERS → folder Clusters_Stabs without file stem hit).
+            majority = evidence >= 0.67 and (file_ratio >= 0.34 or folder_sc >= 0.5)
             if not (strong_name or majority or semantic_folder):
                 return
             # Soft_Piano vs Harsh_Piano: shared category token, weak whole-name sim.
@@ -1431,12 +1568,32 @@ def run_pipeline(
             master = generate_placeholder_artwork(ai_prompt, vendor_s, library_s)
             _log("Generated placeholder / AI-description artwork")
 
-        image_dest = DEFAULT_IMAGE_ROOT / vendor_s / library_s
-        written = format_ni_images(master, image_dest)
-        result.images_written = {k: str(v) for k, v in written.items()}
-        _log(f"Wrote NI images → {image_dest}")
-        for name, path in written.items():
-            _log(f"  {name} ({NI_IMAGE_SPECS[name][0]}x{NI_IMAGE_SPECS[name][1]}) → {path}")
+        # Install into flat library folder (Kontakt/KK primary) + vendor path (compat).
+        install_dirs = ni_image_install_dirs(vendor_s, library_s)
+        # Clean mistaken nested Samples/ leftovers under flat library folder.
+        primary = install_dirs[0]
+        stray_samples = primary / "Samples"
+        if stray_samples.is_dir():
+            import shutil as _shutil
+            _shutil.rmtree(stray_samples, ignore_errors=True)
+            _log(f"Removed stray image/Samples folder under {primary}")
+
+        all_written: dict[str, Path] = {}
+        for image_dest in install_dirs:
+            written = format_ni_images(master, image_dest)
+            meta = write_image_resource_meta(library_s, image_dest)
+            written[meta.name] = meta
+            all_written.update({f"{image_dest.name}/{k}" if image_dest != install_dirs[0] else k: v for k, v in written.items()})
+            _log(f"Wrote NI images + meta → {image_dest}")
+            for name, path in written.items():
+                if name.endswith(".meta"):
+                    _log(f"  {name} → {path}")
+                    continue
+                spec_key = name.replace(".webp", ".png")
+                dims = NI_IMAGE_SPECS.get(spec_key) or NI_IMAGE_SPECS.get(name)
+                dim_s = f"{dims[0]}x{dims[1]}" if dims else "?"
+                _log(f"  {name} ({dim_s}) → {path}")
+        result.images_written = {k: str(v) for k, v in all_written.items()}
         _prog(0.30, "Stage 1/3 · Images complete")
     except Exception as exc:  # noqa: BLE001
         result.errors.append(f"Image formatting failed: {exc}")
@@ -1449,6 +1606,12 @@ def run_pipeline(
         db_path = write_dist_database(vendor_s, library_s, DEFAULT_DIST_DB_ROOT)
         result.database_path = str(db_path)
         _log(f"Database → {db_path}")
+        try:
+            ql = ensure_quickload_aliases(source_path, vendor_s, library_s)
+            _log(f"QuickLoad aliases → {ql}")
+        except Exception as ql_exc:  # noqa: BLE001
+            result.warnings.append(f"QuickLoad alias setup: {ql_exc}")
+            _log(f"QuickLoad alias warning: {ql_exc}")
         _prog(0.45, "Stage 2/3 · Database complete")
     except Exception as exc:  # noqa: BLE001
         result.errors.append(f"Database injection failed: {exc}")

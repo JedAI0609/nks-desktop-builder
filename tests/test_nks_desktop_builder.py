@@ -211,19 +211,15 @@ class TestNiAssets:
     def test_format_ni_image_dimensions(self, tmp_path: Path):
         img = m.generate_placeholder_artwork("test", "Vendor", "Library")
         written = m.format_ni_images(img, tmp_path / "out")
-        assert set(written) == set(m.NI_IMAGE_SPECS)
-        assert len(written) == 6
-        expected = {
-            "MST_artwork.png": (134, 66),
-            "MST_logo.png": (134, 66),
-            "BND_artwork.png": (272, 90),
-            "BND_logo.png": (272, 90),
-            "NKS2_software_tile.png": (420, 136),
-            "NKS2_hardware_banner.png": (1280, 212),
-        }
-        assert m.NI_IMAGE_SPECS == expected
-        for name, dims in expected.items():
+        # PNG specs + WEBP aliases for NKS2 assets
+        assert set(m.NI_IMAGE_SPECS).issubset(set(written))
+        for webp in m.NI_WEBP_ALIASES.values():
+            assert webp in written
+        for name, dims in m.NI_IMAGE_SPECS.items():
             assert Image.open(written[name]).size == dims
+        assert Image.open(written["NKS2_software_tile.webp"]).size == (420, 316)
+        assert Image.open(written["NKS2_hardware_banner.webp"]).size == (1280, 212)
+        assert Image.open(written["NKS2_hardware_banner_1280x152.webp"]).size == (1280, 152)
 
     def test_dist_database_payload(self, tmp_path: Path):
         path = m.write_dist_database("Acme", "Neon Pads", dest_root=tmp_path)
@@ -232,6 +228,9 @@ class TestNiAssets:
         assert data["library"] == "Neon Pads"
         assert data["shortname"] == "neon_pads"
         assert data["product"]["nks"] is True
+        assert data["paths"]["image"] == "image/Neon Pads"
+        assert (tmp_path / "Neon Pads" / "database.json").is_file()
+        assert (tmp_path / "Acme" / "Neon Pads" / "Neon Pads.meta").is_file()
 
 
 # ---------------------------------------------------------------------------
