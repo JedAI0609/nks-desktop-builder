@@ -1,0 +1,42 @@
+# Python / venvs
+venv/
+venv-tk/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+
+# PyInstaller artifacts
+build/
+dist/
+*.app/
+NKS Desktop Builder.app/
+
+# Local test sandboxes
+nks_final_*/
+nks_core_test_*/
+.tmp-previews-verification/
+
+# OS / editor
+.DS_Store
+*.swp
+*~
+
+# Unrelated sibling projects under ~/dev (tracked elsewhere)
+ETHOS/
+File-Attachment-Manager/
+File-Manager-Tool/
+File-Manager-Tool.zip
+GigCaptureCompanion/
+Grouper/
+Grouper-Desktop-Frontend/
+Kairos-WebFirst/
+claim-benefits-organizer/
+crownfit-ai-warp/
+gighub-assistant/
+gighub-mobile/
+lib-kompanion/
+lib-kompanion-build-verify/
+lib-kompanion-origin.git/
+plugin-inventory/
