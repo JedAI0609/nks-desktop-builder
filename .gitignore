@@ -45,3 +45,9 @@ plugin-inventory/
 NKS Desktop Builder/
 
 .pytest_cache/
+
+# Local verification libraries / agent tooling (not part of product)
+nks_nks2_verify/
+nks_ogg_verify/
+nks_verify_library/
+chatgpt-oz-mcp/

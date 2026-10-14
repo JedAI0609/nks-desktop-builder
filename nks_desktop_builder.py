@@ -586,6 +586,65 @@ _PREFERRED_AUDIO_DIR_NAMES = (
 )
 
 
+# Stopwords / pure library-code tokens ignored during keyword cross-reference.
+_TOKEN_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "of",
+        "to",
+        "in",
+        "on",
+        "for",
+        "nki",
+        "nksn",
+        "nksf",
+        "nkm",
+        "wav",
+        "mp3",
+        "ogg",
+        "sample",
+        "samples",
+        "kit",
+        "bank",
+        "preset",
+        "presets",
+        "v1",
+        "v2",
+        "v3",
+    }
+)
+
+# Semantic hints: preset token → preferred Samples subfolder name fragments.
+_FOLDER_SEMANTIC_HINTS: dict[str, tuple[str, ...]] = {
+    "clock": ("clock", "timing", "time", "tempo", "rhythm", "beat", "metro"),
+    "clocks": ("clock", "timing", "time", "tempo", "rhythm", "beat", "metro"),
+    "timing": ("timing", "time", "clock", "2nd", "second"),
+    "loop": ("loop", "loops", "phrase", "cycle"),
+    "loops": ("loop", "loops", "phrase", "cycle"),
+    "oneshot": ("oneshot", "one shot", "oneshots", "hit", "hits", "shot"),
+    "oneshots": ("oneshot", "oneshots", "hit", "hits", "shot"),
+    "hit": ("hit", "hits", "oneshot", "shot", "perc"),
+    "hits": ("hit", "hits", "oneshot", "shot", "perc"),
+    "pad": ("pad", "pads", "atmosphere", "atmo", "texture"),
+    "pads": ("pad", "pads", "atmosphere", "atmo", "texture"),
+    "bass": ("bass", "sub", "low"),
+    "lead": ("lead", "leads", "synth"),
+    "pluck": ("pluck", "plucks"),
+    "drum": ("drum", "drums", "kit", "perc"),
+    "drums": ("drum", "drums", "kit", "perc"),
+    "perc": ("perc", "percussion", "drum"),
+    "vocal": ("vocal", "vocals", "vox", "voice"),
+    "vox": ("vox", "vocal", "voice"),
+    "fx": ("fx", "effect", "effects", "riser", "impact"),
+    "riser": ("riser", "fx", "sweep"),
+    "impact": ("impact", "fx", "hit"),
+}
+
+
 def _normalize_audio_key(name: str) -> str:
     """Normalize preset/audio basenames for fuzzy equality (case, separators)."""
     s = (name or "").strip().lower()
@@ -599,8 +658,6 @@ def _strip_library_prefixes(stem: str) -> list[str]:
     """
     Produce cleaned variants of a preset stem by stripping common leading
     library prefixes such as MB03_, LIB1-, A1_, etc.
-
-    Returns unique variants including the original stem (first).
     """
     raw = (stem or "").strip()
     variants: list[str] = []
@@ -616,8 +673,6 @@ def _strip_library_prefixes(stem: str) -> list[str]:
             variants.append(v)
 
     add(raw)
-
-    # Repeatedly peel alphanumeric library tags: MB03_, MX_01_, LIB12-
     peeled = raw
     for _ in range(4):
         m = re.match(
@@ -629,21 +684,50 @@ def _strip_library_prefixes(stem: str) -> list[str]:
         peeled = m.group(1)
         add(peeled)
 
-    # Also drop a single leading token before underscore if remainder is long enough
     parts = re.split(r"[_\-]+", raw)
     if len(parts) >= 2:
-        # Prefer joining all but first token (MB03_Clocks_Loops → Clocks_Loops)
         add("_".join(parts[1:]))
         add(" ".join(parts[1:]))
-        # And last significant token alone if long enough (Clocks)
         if len(parts[-1]) >= 4:
             add(parts[-1])
-
     return variants
 
 
+def _preset_tokens(stem: str) -> list[str]:
+    """
+    Split a preset stem into meaningful word tokens.
+    e.g. MB03_Clocks_Loops.nki → ['clocks', 'loops'] (MB03 dropped as code prefix).
+    """
+    variants = _strip_library_prefixes(stem)
+    # Prefer the most stripped non-empty variant for tokenization
+    base = variants[-1] if variants else (stem or "")
+    raw_parts = re.split(r"[^A-Za-z0-9]+", base)
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for part in raw_parts:
+        t = part.strip().lower()
+        if not t or len(t) < 2:
+            continue
+        # Drop pure library codes like mb03, a1, v2 if short alnum mix
+        if re.fullmatch(r"[a-z]{0,4}\d{1,4}[a-z]{0,2}", t) and t not in _FOLDER_SEMANTIC_HINTS:
+            continue
+        if t in _TOKEN_STOPWORDS:
+            continue
+        if t not in seen:
+            seen.add(t)
+            tokens.append(t)
+    # Also keep tokens from full stem if base was over-stripped
+    if not tokens:
+        for part in re.split(r"[^A-Za-z0-9]+", stem or ""):
+            t = part.strip().lower()
+            if len(t) >= 3 and t not in _TOKEN_STOPWORDS and t not in seen:
+                seen.add(t)
+                tokens.append(t)
+    return tokens
+
+
 def _sequence_similarity(a: str, b: str) -> float:
-    """Simple 0..1 similarity for ranking fuzzy name pairs."""
+    """Simple 0..1 similarity for ranking name pairs."""
     if not a or not b:
         return 0.0
     if a == b:
@@ -651,7 +735,6 @@ def _sequence_similarity(a: str, b: str) -> float:
     if a in b or b in a:
         shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
         return 0.72 + 0.28 * (len(shorter) / max(len(longer), 1))
-    # token overlap on split digits/letters
     ta = set(re.findall(r"[a-z]+|\d+", a))
     tb = set(re.findall(r"[a-z]+|\d+", b))
     if not ta or not tb:
@@ -669,6 +752,76 @@ def _is_under_samples_tree(path: Path, source_root: Path) -> bool:
     return any(p in {"samples", "sample", "wavs", "waves", "audio"} for p in parts)
 
 
+def _samples_subfolder_labels(path: Path, source_root: Path) -> list[str]:
+    """
+    Folder names under Samples/ that contain this file.
+    e.g. Samples/05_OneShots/Hit.wav → ['05_oneshots', 'oneshots', ...]
+    """
+    try:
+        rel_parts = list(path.relative_to(source_root).parts[:-1])
+    except ValueError:
+        rel_parts = list(path.parts[:-1])
+    labels: list[str] = []
+    lower_parts = [p.lower() for p in rel_parts]
+    # Find Samples anchor and take everything after it
+    anchor_idx = None
+    for i, p in enumerate(lower_parts):
+        if p in {"samples", "sample", "wavs", "waves", "audio"}:
+            anchor_idx = i
+            break
+    segment = rel_parts[anchor_idx + 1 :] if anchor_idx is not None else rel_parts
+    for seg in segment:
+        low = seg.lower()
+        labels.append(low)
+        # Also add tokenized fragments: 01_2nd Timing → 2nd, timing
+        for tok in re.split(r"[^a-z0-9]+", low):
+            if len(tok) >= 2:
+                labels.append(tok)
+    return labels
+
+
+def _folder_token_score(tokens: list[str], path: Path, source_root: Path) -> float:
+    """
+    How well Samples/ subfolder names align with preset tokens (+ semantic hints).
+    Higher is better. 0 = no relationship.
+    """
+    if not tokens:
+        return 0.0
+    labels = _samples_subfolder_labels(path, source_root)
+    if not labels:
+        return 0.0
+    label_blob = " ".join(labels)
+    score = 0.0
+    for tok in tokens:
+        if tok in label_blob or any(tok in lab or lab in tok for lab in labels if len(lab) >= 3):
+            score += 1.0
+        for hint in _FOLDER_SEMANTIC_HINTS.get(tok, ()):
+            if hint in label_blob or any(hint in lab for lab in labels):
+                score += 0.85
+                break
+    # Normalize roughly by token count
+    return score / max(len(tokens), 1)
+
+
+def _filename_token_score(tokens: list[str], path: Path) -> float:
+    if not tokens:
+        return 0.0
+    name_norm = _normalize_audio_key(path.stem)
+    name_low = path.stem.lower()
+    score = 0.0
+    for tok in tokens:
+        tn = _normalize_audio_key(tok)
+        if not tn:
+            continue
+        if tn == name_norm:
+            score += 1.2
+        elif tn in name_norm or tok in name_low:
+            score += 0.9
+        else:
+            score += 0.5 * _sequence_similarity(tn, name_norm)
+    return score / max(len(tokens), 1)
+
+
 def _list_all_audio_paths(index: dict[str, list[Path]]) -> list[Path]:
     seen: set[str] = set()
     out: list[Path] = []
@@ -684,9 +837,7 @@ def _list_all_audio_paths(index: dict[str, list[Path]]) -> list[Path]:
 
 
 def _audio_dir_priority(path: Path, source_root: Path) -> int:
-    """
-    Lower is better. Prefer files nested under Samples / Instruments Data / etc.
-    """
+    """Lower is better. Prefer Samples / Instruments Data trees."""
     try:
         rel_parts = [p.lower() for p in path.relative_to(source_root).parts[:-1]]
     except ValueError:
@@ -695,41 +846,104 @@ def _audio_dir_priority(path: Path, source_root: Path) -> int:
     for i, preferred in enumerate(_PREFERRED_AUDIO_DIR_NAMES):
         if preferred in rel_parts:
             best = min(best, i)
-    # Slight preference for deeper sample trees over root-level orphans
     depth_bonus = 0 if best < 50 else min(len(rel_parts), 9)
     return best * 10 + (0 if best < 50 else 10 - depth_bonus)
 
 
 def _is_metadata_or_junk_audio(path: Path) -> bool:
     """
-    True for macOS / DAW sidecar junk that must never be fed to ffmpeg.
+    Purge macOS AppleDouble / hidden metadata — never feed to ffmpeg.
 
-    Filters:
-      - filenames starting with '.' or '_'  (._Foo.wav, _tmp.wav, .hidden.wav)
-      - anything under __MACOSX or AppleDouble '._*' path segments
-      - anything under .previews (generated outputs, not sources)
+    Rejects:
+      - any path string containing '._'
+      - filenames beginning with '.' or '_'
+      - __MACOSX / .previews path segments
     """
+    full = str(path)
+    if "._" in full.replace("/.", "/"):  # catches ._File and /._dirs
+        # Still allow normal extensions like file.wav — only AppleDouble '._'
+        if "/._" in full.replace("\\", "/") or path.name.startswith("._") or "._" in path.name:
+            return True
     name = path.name
     if name.startswith(".") or name.startswith("_"):
+        return True
+    if "._" in name:
         return True
     for part in path.parts:
         if part in {".", ".."}:
             continue
-        if part == "__MACOSX" or part == ".previews" or part.startswith("._"):
+        if part == "__MACOSX" or part == ".previews":
+            return True
+        if part.startswith(".") or part.startswith("_"):
+            return True
+        if part.startswith("._") or "._" in part:
             return True
     return False
 
 
+def is_safe_audio_file(path: Path) -> bool:
+    """
+    Pre-flight check before ffmpeg:
+      - exists, is file
+      - not metadata junk
+      - size > 0 bytes
+      - optional container sniff via ffprobe when available
+    """
+    try:
+        if not path.is_file():
+            return False
+        if _is_metadata_or_junk_audio(path):
+            return False
+        if path.stat().st_size <= 0:
+            return False
+        # Reject tiny AppleDouble-ish stubs (< 64 bytes almost never real PCM wav)
+        if path.suffix.lower() in {".wav", ".wave"} and path.stat().st_size < 64:
+            return False
+    except OSError:
+        return False
+
+    # Best-effort legitimacy check with ffprobe (does not modify file)
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        try:
+            proc = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=format_name:stream=codec_type",
+                    "-of",
+                    "csv=p=0",
+                    str(path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            out = (proc.stdout or "").lower()
+            err = (proc.stderr or "").lower()
+            if proc.returncode != 0:
+                return False
+            if "invalid" in err or "error" in err and "not found" not in err:
+                # soft: still allow if stdout looks like audio
+                if "audio" not in out:
+                    return False
+            if out and "audio" not in out and "wav" not in out and "aiff" not in out:
+                # format line might just be "wav" without stream lines depending on build
+                if not any(x in out for x in ("wav", "aiff", "mp3", "flac", "ogg", "mov", "mp4")):
+                    return False
+        except (OSError, subprocess.TimeoutExpired):
+            # If ffprobe unavailable/hangs, size checks already passed
+            pass
+    return True
+
+
 def build_source_audio_index(source_root: Path) -> dict[str, list[Path]]:
     """
-    Deep recursive index of all audio under source_root (any nested depth),
-    including Samples / Instruments Data / Instruments / …
-
-    Completely ignores files whose names start with '.' or '_' (macOS metadata
-    sidecars) and anything under .previews / hidden path segments.
-
-    Keys are lowercased stems; also stores a parallel normalized map via
-    the special key namespace used by pick_matching_wav / rank_matching_wavs.
+    Deep recursive index under source_root.
+    Purges AppleDouble / dotfile / underscore metadata before indexing.
     """
     index: dict[str, list[Path]] = {}
     for path in source_root.rglob("*"):
@@ -737,13 +951,16 @@ def build_source_audio_index(source_root: Path) -> dict[str, list[Path]]:
             continue
         if path.suffix.lower() not in SOURCE_AUDIO_EXTENSIONS:
             continue
-        # Never treat generated previews as source audio
         if any(part == ".previews" for part in path.parts):
             continue
-        # Ignore macOS / system metadata sidecars (._*, _*, hidden paths)
         if _is_metadata_or_junk_audio(path):
             continue
-        # Read-only discovery — do not open/alter the file here
+        # Skip zero-byte stubs early
+        try:
+            if path.stat().st_size <= 0:
+                continue
+        except OSError:
+            continue
         stem_key = path.stem.lower()
         index.setdefault(stem_key, []).append(path)
         norm = _normalize_audio_key(path.stem)
@@ -758,88 +975,91 @@ def rank_matching_wavs(
     source_root: Path | None = None,
 ) -> list[Path]:
     """
-    Ordered candidate pool for a preset stem (best first).
+    Strict priority audio mapping (NO random first-available fallback):
 
-    Used so ffmpeg can try the next file if one returns "Invalid data found".
-    Never includes metadata sidecars (filtered at index time).
+      1. Purge metadata (already done at index time + re-checked here)
+      2. Exact / prefix-stripped 1:1 name match
+      3. Keyword tokens from preset (MB03_Clocks_Loops → clocks, loops)
+      4. Prefer Samples/ subfolders whose names align with those tokens
+         (e.g. timing/clocks/loops folders over unrelated oneshots)
+      5. Only return candidates with real token/name/folder relevance
+         OR verified exact stem match — never a random unrelated .wav
+
+    Each candidate is size/legitimacy-checked via is_safe_audio_file().
     """
     root = source_root or Path("/")
     ext_rank = {ext: i for i, ext in enumerate(SOURCE_AUDIO_EXTENSIONS)}
-    all_audio = [p for p in _list_all_audio_paths(index) if not _is_metadata_or_junk_audio(p)]
+    all_audio = [
+        p
+        for p in _list_all_audio_paths(index)
+        if not _is_metadata_or_junk_audio(p) and is_safe_audio_file(p)
+    ]
     if not all_audio:
         return []
 
     samples_audio = [p for p in all_audio if _is_under_samples_tree(p, root)]
-    preferred_pool = samples_audio or all_audio
+    search_pool = samples_audio if samples_audio else all_audio
 
-    scored: list[tuple[float, int, int, Path]] = []  # (-sim, dir_pri, ext_pri, path)
+    tokens = _preset_tokens(stem)
+    variants = _strip_library_prefixes(stem)
+    norms = [_normalize_audio_key(v) for v in variants if _normalize_audio_key(v)]
+
+    scored: list[tuple[float, float, float, int, int, Path]] = []
+    # tuple: (-total, -folder, -file, dir_pri, ext_pri, path)
     seen: set[str] = set()
 
-    def consider(path: Path, similarity: float) -> None:
-        if _is_metadata_or_junk_audio(path):
+    def consider(path: Path, base_sim: float, require_relevance: bool) -> None:
+        if _is_metadata_or_junk_audio(path) or not is_safe_audio_file(path):
             return
         key = str(path)
         if key in seen:
             return
+        folder_sc = _folder_token_score(tokens, path, root)
+        file_sc = _filename_token_score(tokens, path)
+        # Exact stem bonus already in base_sim
+        total = base_sim + 1.35 * folder_sc + 1.1 * file_sc
+        if require_relevance and base_sim < 0.95:
+            # Must have keyword or folder relationship — no random picks
+            if folder_sc < 0.25 and file_sc < 0.35 and base_sim < 0.5:
+                return
         seen.add(key)
         scored.append(
             (
-                -float(similarity),
+                -total,
+                -folder_sc,
+                -file_sc,
                 _audio_dir_priority(path, root),
                 ext_rank.get(path.suffix.lower(), 999),
                 path,
             )
         )
 
-    variants = _strip_library_prefixes(stem)
-    norms = [_normalize_audio_key(v) for v in variants if _normalize_audio_key(v)]
-
-    # 1–2) Exact + prefix-stripped exact
+    # --- Priority 1: exact / stripped exact names ---
     for v in variants:
         for p in index.get(v.lower(), []):
-            consider(p, 1.0)
+            consider(p, 1.0, require_relevance=False)
         nv = _normalize_audio_key(v)
         if nv:
             for p in index.get(f"norm:{nv}", []):
-                consider(p, 0.98)
+                consider(p, 0.98, require_relevance=False)
 
-    # 3) Partial / fuzzy against preferred pool
-    for p in preferred_pool:
+    # --- Priority 2–3: token + Samples subfolder cross-reference ---
+    for p in search_pool:
         pnorm = _normalize_audio_key(p.stem)
-        best_sim = 0.0
+        best = 0.0
         for nv in norms:
-            if not nv or len(nv) < 3:
+            if not nv:
                 continue
             if nv == pnorm:
-                best_sim = max(best_sim, 1.0)
+                best = max(best, 1.0)
+            elif nv in pnorm or pnorm in nv:
+                best = max(best, 0.75)
             else:
-                best_sim = max(best_sim, _sequence_similarity(nv, pnorm))
-        if best_sim >= 0.34:
-            consider(p, best_sim)
-
-    # 4) Closest-string ranking across preferred pool
-    ranked: list[tuple[float, Path]] = []
-    for p in preferred_pool:
-        pnorm = _normalize_audio_key(p.stem)
-        sim = max((_sequence_similarity(nv, pnorm) for nv in norms), default=0.0)
-        ranked.append((sim, p))
-    ranked.sort(key=lambda t: (-t[0], _audio_dir_priority(t[1], root), str(t[1]).lower()))
-    for sim, p in ranked:
-        if sim > 0:
-            consider(p, sim)
-
-    # 5) Full pool fallback order — every remaining valid wav, Samples first
-    wavs = [
-        p for p in preferred_pool if p.suffix.lower() in {".wav", ".wave"}
-    ] or list(preferred_pool)
-    for p in sorted(wavs, key=lambda p: (_audio_dir_priority(p, root), str(p).lower())):
-        consider(p, 0.01)
-    # Absolute last resort: any audio in the library
-    for p in sorted(all_audio, key=lambda p: (_audio_dir_priority(p, root), str(p).lower())):
-        consider(p, 0.001)
+                best = max(best, _sequence_similarity(nv, pnorm))
+        consider(p, best, require_relevance=True)
 
     scored.sort()
-    return [t[3] for t in scored]
+    return [t[5] for t in scored]
 
 
 def pick_matching_wav(
@@ -847,7 +1067,7 @@ def pick_matching_wav(
     index: dict[str, list[Path]],
     source_root: Path | None = None,
 ) -> Path | None:
-    """Best single candidate (first of ranked pool). Prefer rank_matching_wavs for retries."""
+    """Best single candidate (first of ranked pool). No random fallback."""
     ranked = rank_matching_wavs(stem, index, source_root=source_root)
     return ranked[0] if ranked else None
 

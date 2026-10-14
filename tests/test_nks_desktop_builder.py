@@ -130,15 +130,28 @@ class TestAudioDiscovery:
         assert hit.name == "Clocks_Loops.wav"
         assert "Samples" in hit.parts
 
-    def test_fallback_uses_first_samples_wav(self, tmp_path: Path, ffmpeg: str):
+    def test_no_random_fallback_for_unrelated_name(self, tmp_path: Path, ffmpeg: str):
+        """Unrelated presets must NOT grab a random first Samples wav."""
         root = tmp_path / "Lib"
-        samples = root / "Samples"
+        samples = root / "Samples" / "05_OneShots"
         samples.mkdir(parents=True)
         _make_wav(ffmpeg, samples / "OnlyOne.wav", 330)
         idx = m.build_source_audio_index(root)
         hit = m.pick_matching_wav("TotallyUnrelatedPresetName", idx, root)
+        assert hit is None
+
+    def test_subfolder_keyword_prefers_timing(self, tmp_path: Path, ffmpeg: str):
+        root = tmp_path / "Lib"
+        timing = root / "Samples" / "01_2nd Timing"
+        oneshots = root / "Samples" / "05_OneShots"
+        timing.mkdir(parents=True)
+        oneshots.mkdir(parents=True)
+        _make_wav(ffmpeg, timing / "GrooveA.wav", 440)
+        _make_wav(ffmpeg, oneshots / "HitA.wav", 880)
+        idx = m.build_source_audio_index(root)
+        hit = m.pick_matching_wav("MB03_Clocks_Loops", idx, root)
         assert hit is not None
-        assert hit.name == "OnlyOne.wav"
+        assert "01_2nd Timing" in hit.parts or "timing" in str(hit).lower()
 
     def test_previews_folder_excluded_from_index(self, tmp_path: Path, ffmpeg: str):
         root = tmp_path / "Lib"

@@ -135,6 +135,17 @@ README.md
 - **ffmpeg**: this project’s Homebrew build often exposes native `vorbis` (not `libvorbis`). The app uses `-c:a vorbis -strict -2 -ac 2`.
 - **Drag-and-drop**: enabled if `tkinterdnd2` is installed; otherwise use Browse or paste a path.
 - **AI artwork**: placeholder is generated with Pillow; `requests` is available for a future generative API.
+- **Preview audio matching**: presets are paired to source WAVs using filename similarity plus Samples-subfolder/token scoring (e.g. “loop/clock” → timing folders). Unrelated presets do **not** fall back to a random first sample.
+- **Safe audio gate**: candidates must exist, be non-empty, and (when `ffprobe` is available) decode as audio before preview encode.
+
+### Tests
+
+```bash
+python3.13 -m venv .venv
+source .venv/bin/activate
+pip install pillow pytest
+pytest tests/test_nks_desktop_builder.py -q
+```
 
 ---
 
